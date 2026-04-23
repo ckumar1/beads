@@ -1844,6 +1844,26 @@ func (s *DoltStore) mainRemoteCredentials() *remoteCredentials {
 	return &remoteCredentials{username: s.remoteUser, password: s.remotePassword}
 }
 
+// discardIgnoredWorkingSet resets tables in dolt_ignore from the working set.
+// dolt_ignore prevents these tables from being staged/committed, so they
+// remain dirty after auto-commit. Dolt merge refuses to run against any
+// non-empty working set, so we must discard them before pulling.
+// CALL DOLT_CHECKOUT('.') resets all working-set changes to HEAD state.
+// Safe to call after an auto-commit: only ignored tables should remain dirty.
+func (s *DoltStore) discardIgnoredWorkingSet(ctx context.Context) error {
+	var count int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_status").Scan(&count); err != nil {
+		return fmt.Errorf("dolt_status check: %w", err)
+	}
+	if count == 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, "CALL DOLT_CHECKOUT('.')"); err != nil {
+		return fmt.Errorf("DOLT_CHECKOUT('.'): %w", err)
+	}
+	return nil
+}
+
 // prePushFSCK runs dolt fsck --quiet to verify local chunk integrity before
 // pushing. This prevents propagating Dolt remote corruption (dangling blob
 // references) that arise when concurrent pushes race on the remote manifest.
@@ -2039,6 +2059,13 @@ func (s *DoltStore) Pull(ctx context.Context) (retErr error) {
 			if !isDoltNothingToCommit(err) {
 				return fmt.Errorf("failed to commit pending changes before pull: %w", err)
 			}
+		}
+		// Discard any remaining working-set changes (dolt_ignore'd tables like
+		// wisps are never committed, so they stay dirty after the commit above).
+		// Dolt merge refuses to run against a non-empty working set regardless of
+		// dolt_ignore, so we must reset them before pulling.
+		if err := s.discardIgnoredWorkingSet(ctx); err != nil {
+			return fmt.Errorf("failed to clear ignored tables before pull: %w", err)
 		}
 	}
 

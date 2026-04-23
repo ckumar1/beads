@@ -57,6 +57,23 @@ func TestPrePushFSCK_CleanDB(t *testing.T) {
 	}
 }
 
+// TestDiscardIgnoredWorkingSet_EmptyStatus verifies that discardIgnoredWorkingSet
+// is a no-op when dolt_status reports nothing dirty. Requires the test Dolt server.
+func TestDiscardIgnoredWorkingSet_EmptyStatus(t *testing.T) {
+	t.Parallel()
+	if testServerPort == 0 {
+		t.Skip("Test Dolt server not running, skipping test")
+	}
+	db, cleanup := newTestDoltDB(t)
+	defer cleanup()
+
+	s := &DoltStore{db: db}
+	// A fresh test DB has no dirty tables — should return nil without calling CHECKOUT.
+	if err := s.discardIgnoredWorkingSet(context.Background()); err != nil {
+		t.Fatalf("expected nil for empty status, got %v", err)
+	}
+}
+
 // TestPrePushFSCK_CorruptNoms verifies that prePushFSCK returns
 // ErrDanglingReference when dolt fsck detects an invalid local store.
 // We simulate corruption by creating a .dolt/noms directory without running

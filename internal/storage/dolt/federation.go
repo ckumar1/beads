@@ -54,6 +54,10 @@ func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Confli
 				return nil, fmt.Errorf("failed to commit pending changes before pull: %w", err)
 			}
 		}
+		// Discard dolt_ignore'd tables remaining in working set (see discardIgnoredWorkingSet).
+		if err := s.discardIgnoredWorkingSet(ctx); err != nil {
+			return nil, fmt.Errorf("failed to clear ignored tables before pull: %w", err)
+		}
 	}
 
 	var conflicts []storage.Conflict
