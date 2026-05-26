@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -17,10 +18,21 @@ import (
 // pushState tracks auto-push state in a local file (.beads/push-state.json)
 // instead of the Dolt metadata table, to avoid merge conflicts on multi-machine
 // setups (GH#2466).
+//
+// LastSuccess / FailureStreak / LastFailureReason let `gt dolt status` (and
+// other observers) surface persistent autopush stalls. Without these, repeated
+// timeouts silently throttle-and-retry forever; the only signal is a stderr
+// warning that agent-invoked bd never sees.
 type pushState struct {
-	LastPush   string `json:"last_push"`   // RFC3339 timestamp
-	LastCommit string `json:"last_commit"` // Dolt commit hash
+	LastPush          string `json:"last_push"`                     // RFC3339 timestamp of most recent push attempt (success or failure)
+	LastCommit        string `json:"last_commit"`                   // Dolt commit hash from last SUCCESSFUL push; left unchanged on failure so change-detection still triggers retries
+	LastSuccess       string `json:"last_success,omitempty"`        // RFC3339 timestamp of last SUCCESSFUL push
+	FailureStreak     int    `json:"failure_streak,omitempty"`      // consecutive failures since last success; cleared on success
+	LastFailureReason string `json:"last_failure_reason,omitempty"` // error message from most recent failure (truncated)
 }
+
+// maxFailureReasonLen bounds LastFailureReason to keep push-state.json small.
+const maxFailureReasonLen = 200
 
 func pushStatePath() (string, error) {
 	beadsDir := beads.FindBeadsDir()
@@ -137,43 +149,70 @@ func maybeAutoPush(ctx context.Context) {
 		return
 	}
 
-	// Push. Bound with a short timeout so a hanging remote (e.g. unreachable
-	// host, corrupted chunk store) doesn't block bd from exiting. The write is
-	// already committed locally; auto-push is best-effort sync.
-	pushTimeout := config.GetDuration("dolt.auto-push-timeout")
-	if pushTimeout == 0 {
-		pushTimeout = 30 * time.Second
+	// Fork a detached worker subprocess that performs the actual push (hq-8nkpj4).
+	// The worker survives bd's exit, so the push isn't bounded by gt's 60s
+	// bd-subprocess kill window — a clone that has accumulated more than a few
+	// seconds of unpushed chunks can still auto-recover. The parent debounces
+	// future triggers by pre-stamping LastPush before the fork, so concurrent
+	// bd writes don't pile up workers.
+	//
+	// The previous inline path used a 30s timeout to fit under the kill window;
+	// for clones that fell behind by more than 30s of upload (real workspaces
+	// see this regularly), every autopush timed out and divergence grew
+	// unbounded until writes started blocking on merge conflicts.
+	if ps == nil {
+		ps = &pushState{}
 	}
-	pushCtx, pushCancel := context.WithTimeout(ctx, pushTimeout)
-	defer pushCancel()
-	debug.Logf("dolt auto-push: pushing to origin (timeout %s)...\n", pushTimeout)
-	if err := st.Push(pushCtx); err != nil {
-		if !isQuiet() && !jsonOutput {
-			fmt.Fprintf(os.Stderr, "Warning: dolt auto-push failed: %v\n", err)
-			if isDivergedHistoryErr(err) {
-				printDivergedHistoryGuidance("push")
-			}
-		}
-		debug.Logf("dolt auto-push: push error: %v\n", err)
-		// Throttle retries after failure so a hanging remote doesn't make every
-		// subsequent bd command pay the push timeout. We record the attempt
-		// timestamp but NOT a new LastCommit, so when the remote recovers the
-		// change-detection check (currentCommit != LastCommit) still triggers.
-		if ps == nil {
-			ps = &pushState{}
-		}
-		ps.LastPush = time.Now().UTC().Format(time.RFC3339)
-		if saveErr := savePushState(ps); saveErr != nil {
-			debug.Logf("dolt auto-push: failed to save push state after error: %v\n", saveErr)
-		}
+	ps.LastPush = time.Now().UTC().Format(time.RFC3339)
+	if saveErr := savePushState(ps); saveErr != nil {
+		debug.Logf("dolt auto-push: failed to pre-stamp push state: %v\n", saveErr)
+		// Continue anyway — debounce will be slightly weaker for one cycle.
+	}
+
+	if err := spawnAutopushWorker(); err != nil {
+		// Spawn failure is rare (exec missing, fork limit hit). Don't surface
+		// to user — autopush is best-effort and the next bd command will retry.
+		debug.Logf("dolt auto-push: failed to spawn worker: %v\n", err)
 		return
 	}
+	debug.Logf("dolt auto-push: dispatched detached worker\n")
+}
 
-	// Record last push time and commit to local file
-	now := time.Now().UTC().Format(time.RFC3339)
-	if err := savePushState(&pushState{LastPush: now, LastCommit: currentCommit}); err != nil {
-		debug.Logf("dolt auto-push: failed to save push state: %v\n", err)
+// spawnAutopushWorker forks the hidden `bd dolt _autopush-worker` subcommand
+// in a new process group so the push survives the parent's exit. Returns
+// immediately; the worker is fire-and-forget.
+func spawnAutopushWorker() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("finding bd executable: %w", err)
 	}
+	cmd := exec.Command(exe, "dolt", "_autopush-worker") //nolint:gosec // fixed subcommand
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.SysProcAttr = autopushDetachedAttr()
+	cmd.Env = os.Environ()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	// Release the child immediately. Without this, the parent's process table
+	// entry for the child accumulates until reap; Release decouples ownership.
+	if cmd.Process != nil {
+		_ = cmd.Process.Release()
+	}
+	return nil
+}
 
-	debug.Logf("dolt auto-push: pushed successfully\n")
+// truncateReason caps an error message at maxFailureReasonLen runes so
+// push-state.json stays small even when a remote returns verbose error text.
+func truncateReason(s string) string {
+	if len(s) <= maxFailureReasonLen {
+		return s
+	}
+	// Truncate at rune boundary, append ellipsis marker.
+	runes := []rune(s)
+	if len(runes) <= maxFailureReasonLen {
+		return s
+	}
+	return string(runes[:maxFailureReasonLen]) + "…"
 }

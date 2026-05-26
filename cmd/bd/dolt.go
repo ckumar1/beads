@@ -1061,6 +1061,7 @@ func init() {
 	doltCmd.AddCommand(doltKillallCmd)
 	doltCmd.AddCommand(doltCleanDatabasesCmd)
 	doltCmd.AddCommand(doltRemoteCmd)
+	doltCmd.AddCommand(autopushWorkerCmd) // hq-8nkpj4: detached push worker
 	rootCmd.AddCommand(doltCmd)
 }
 
