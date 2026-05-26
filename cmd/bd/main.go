@@ -593,7 +593,9 @@ var rootCmd = &cobra.Command{
 		// GH#2042: Dolt subcommands that need the store for version-control operations.
 		// All other dolt subcommands (show, set, test, start, stop, status) are
 		// config/diagnostic commands that skip DB init via the "dolt" parent entry above.
-		needsStoreDoltSubcommands := []string{"push", "pull", "commit"}
+		// _autopush-worker (gt-8cy3) is the detached push worker — it opens the
+		// store and runs the actual push, so it must init like push/pull/commit.
+		needsStoreDoltSubcommands := []string{"push", "pull", "commit", "_autopush-worker"}
 
 		// GH#2224: Dolt grandchild subcommands (e.g. "bd dolt remote add") whose
 		// Cobra parent is "remote", not "dolt". These need the store but would be
