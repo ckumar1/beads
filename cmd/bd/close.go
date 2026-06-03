@@ -168,6 +168,13 @@ the flags appear in the command line.`,
 			// Runs against the same store the step was closed in.
 			autoCloseCompletedMolecule(ctx, activeStore, id, actor, session)
 
+			// Cascade DOWN: if the issue we just closed is a molecule/ephemeral
+			// root, close its still-open parent-child step-children. This is the
+			// inverse of autoCloseCompletedMolecule and prevents orphaned steps
+			// when a molecule root is closed by a non-last-step path (direct
+			// close, abandonment). Ordinary epics do not cascade.
+			cascadeCloseMoleculeSteps(ctx, activeStore, id, actor, session)
+
 			// Re-fetch for display
 			closedIssue, _ := activeStore.GetIssue(ctx, id)
 
@@ -518,6 +525,49 @@ func autoCloseCompletedMolecule(ctx context.Context, s storage.DoltStorage, clos
 
 	if !jsonOutput {
 		fmt.Printf("%s Auto-closed completed molecule %s\n", ui.RenderPass("✓"), formatFeedbackID(moleculeID, root.Title))
+	}
+}
+
+// cascadeCloseMoleculeSteps closes the open parent-child step-children of a
+// molecule/ephemeral root that has just been closed. It is the inverse of
+// autoCloseCompletedMolecule: where that cascades UP (last step closes -> root
+// auto-closes), this cascades DOWN (root closes -> open steps close).
+//
+// Without it, a molecule root closed by a non-last-step path (direct close,
+// abandonment, or a reaper auto-close that routes through `bd close`) leaves
+// its step-children open forever. They accumulate as orphaned open wisps whose
+// parent molecule is already closed — the root cause of the recurring hq reaper
+// wisp-count alert (gt-o5z4).
+//
+// Only roots for which shouldAutoCloseCompletedRoot is true cascade, so plain
+// epics keep their children open. Recursion handles nested molecules; it is
+// safe because parent-child edges form a tree and CloseIssue does not itself
+// re-trigger this cascade.
+func cascadeCloseMoleculeSteps(ctx context.Context, s storage.DoltStorage, closedID, actorName, session string) {
+	root, err := s.GetIssue(ctx, closedID)
+	if err != nil || root == nil || !shouldAutoCloseCompletedRoot(root) {
+		return
+	}
+
+	dependents, err := s.GetDependentsWithMetadata(ctx, closedID)
+	if err != nil {
+		return // Best effort — don't fail the close
+	}
+
+	for _, dep := range dependents {
+		if dep.DependencyType != types.DepParentChild || dep.Issue.Status == types.StatusClosed {
+			continue
+		}
+		if err := s.CloseIssue(ctx, dep.Issue.ID, "parent molecule closed", actorName, session); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not cascade-close step %s of molecule %s: %v\n", dep.Issue.ID, closedID, err)
+			continue
+		}
+		audit.LogFieldChange(dep.Issue.ID, "status", string(dep.Issue.Status), "closed", actorName, "parent molecule closed")
+		if !jsonOutput {
+			fmt.Printf("%s Cascade-closed molecule step %s\n", ui.RenderPass("✓"), formatFeedbackID(dep.Issue.ID, dep.Issue.Title))
+		}
+		// Recurse: a step that is itself a molecule cascades to its own steps.
+		cascadeCloseMoleculeSteps(ctx, s, dep.Issue.ID, actorName, session)
 	}
 }
 
