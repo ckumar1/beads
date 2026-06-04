@@ -146,3 +146,20 @@ func TestSearchCountsSQLShape(t *testing.T) {
 		t.Error("counts SQL must project NULL labels_json when skipLabels is set")
 	}
 }
+
+func TestSearchCountsSQLScopesAggregationsToResultSet(t *testing.T) {
+	t.Parallel()
+
+	sql := SearchCountsSQL(IssuesFilterTables, "WHERE status = ?", "ORDER BY priority", "LIMIT 5", false, false)
+	for _, want := range []string{
+		"WITH base AS (",
+		"SELECT i.* FROM issues i",
+		"WHERE issue_id IN (SELECT id FROM base)",
+		"all_blockers WHERE dep_id IN (SELECT id FROM base)",
+		"FROM base i",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("counts SQL missing scoped aggregation clause %q", want)
+		}
+	}
+}
