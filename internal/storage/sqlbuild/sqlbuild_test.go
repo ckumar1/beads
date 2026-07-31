@@ -116,6 +116,25 @@ func TestBuildReadyWorkWhereBatchesIDSets(t *testing.T) {
 	}
 }
 
+func TestBuildReadyWorkWhereFiltersAnyLabel(t *testing.T) {
+	t.Parallel()
+
+	where, args, err := BuildReadyWorkWhere(types.WorkFilter{
+		LabelsAny:       []string{"platform", "woodhouse"},
+		IncludeDeferred: true,
+	}, IssuesFilterTables, ReadyWorkWhereInputs{})
+	if err != nil {
+		t.Fatalf("BuildReadyWorkWhere: %v", err)
+	}
+	if !strings.Contains(where, "id IN (SELECT issue_id FROM labels WHERE label IN (?, ?))") {
+		t.Fatalf("where = %q, want OR label predicate", where)
+	}
+	wantTail := []any{"platform", "woodhouse"}
+	if len(args) < len(wantTail) || args[len(args)-2] != wantTail[0] || args[len(args)-1] != wantTail[1] {
+		t.Fatalf("args = %#v, want trailing label args %#v", args, wantTail)
+	}
+}
+
 func TestSearchCountsSQLShape(t *testing.T) {
 	t.Parallel()
 
