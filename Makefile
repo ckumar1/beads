@@ -17,6 +17,8 @@ all: build
 
 BUILD_DIR := .
 GIT_BUILD := $(shell git rev-parse --short HEAD)
+GIT_COMMIT := $(shell git rev-parse HEAD)
+GIT_BRANCH := $(shell git branch --show-current)
 ifeq ($(OS),Windows_NT)
 INSTALL_DIR := $(USERPROFILE)/.local/bin
 else
@@ -53,9 +55,9 @@ REGRESSION_TIMEOUT ?= 20m
 build:
 	@echo "Building bd..."
 ifeq ($(OS),Windows_NT)
-	go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd.exe ./cmd/bd
+	go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD) -X main.Commit=$(GIT_COMMIT) -X main.Branch=$(GIT_BRANCH)" -o $(BUILD_DIR)/bd.exe ./cmd/bd
 else
-	go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd ./cmd/bd
+	go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD) -X main.Commit=$(GIT_COMMIT) -X main.Branch=$(GIT_BRANCH)" -o $(BUILD_DIR)/bd ./cmd/bd
 ifeq ($(shell uname),Darwin)
 	@codesign -s - -f $(BUILD_DIR)/bd 2>/dev/null || true
 	@echo "Signed bd for macOS"
