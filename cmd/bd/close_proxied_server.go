@@ -69,9 +69,10 @@ func runCloseProxiedServer(cmd *cobra.Command, ctx context.Context, args []strin
 
 	outcomes := make([]closeProxiedOutcome, 0, len(args))
 	closedIssues := []*types.Issue{}
+	cascadeOutcomes := make([]closeProxiedOutcome, 0)
 	for i, id := range args {
 		reason := reasonForCloseIndex(reasons, i)
-		outcome, ok := closeProxiedOne(ctx, uw, id, reason, in)
+		outcome, ok := closeProxiedOne(ctx, uw, id, reason, in, &cascadeOutcomes)
 		if !ok {
 			continue
 		}
@@ -103,7 +104,8 @@ func runCloseProxiedServer(cmd *cobra.Command, ctx context.Context, args []strin
 		if err := uw.Commit(ctx, msg); err != nil && !isDoltNothingToCommit(err) {
 			FatalErrorRespectJSON("commit close: %v", err)
 		}
-		for _, o := range outcomes {
+		hookOutcomes := append(outcomes, cascadeOutcomes...)
+		for _, o := range hookOutcomes {
 			if !o.closed {
 				continue
 			}
@@ -161,7 +163,7 @@ func gatherCloseProxiedInput(cmd *cobra.Command) closeProxiedInput {
 	return in
 }
 
-func closeProxiedOne(ctx context.Context, uw uow.UnitOfWork, id, reason string, in closeProxiedInput) (closeProxiedOutcome, bool) {
+func closeProxiedOne(ctx context.Context, uw uow.UnitOfWork, id, reason string, in closeProxiedInput, cascadeOutcomes *[]closeProxiedOutcome) (closeProxiedOutcome, bool) {
 	current, isWisp := proxiedResolveIssueOrWisp(ctx, uw, id)
 	if current == nil {
 		fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
@@ -235,6 +237,7 @@ func closeProxiedOne(ctx context.Context, uw uow.UnitOfWork, id, reason string, 
 	audit.LogFieldChange(id, "status", oldStatus, "closed", actor, reason)
 
 	autoCloseProxiedCompletedMolecule(ctx, uw, id, actor, in.session, in.jsonOut)
+	cascadeCloseProxiedMoleculeSteps(ctx, uw, id, actor, in.session, cascadeOutcomes)
 
 	return closeProxiedOutcome{id: id, before: current, after: res.Issue, closed: res.Closed}, true
 }
@@ -363,6 +366,53 @@ func autoCloseProxiedCompletedMolecule(ctx context.Context, uw uow.UnitOfWork, c
 	}
 	if !jsonOut {
 		fmt.Printf("%s Auto-closed completed molecule %s\n", ui.RenderPass("✓"), formatFeedbackID(moleculeID, root.Title))
+	}
+}
+
+func cascadeCloseProxiedMoleculeSteps(ctx context.Context, uw uow.UnitOfWork, closedID, actorName, session string, outcomes *[]closeProxiedOutcome) {
+	cascadeCloseProxiedMoleculeChildren(ctx, uw, closedID, actorName, session, outcomes, make(map[string]bool))
+}
+
+func cascadeCloseProxiedMoleculeChildren(ctx context.Context, uw uow.UnitOfWork, closedID, actorName, session string, outcomes *[]closeProxiedOutcome, visited map[string]bool) {
+	if visited[closedID] {
+		return
+	}
+	visited[closedID] = true
+	root, _ := proxiedResolveIssueOrWisp(ctx, uw, closedID)
+	if root == nil {
+		return
+	}
+	if labels, err := uw.LabelUseCase().GetLabels(ctx, closedID); err == nil {
+		root.Labels = labels
+	}
+	if !shouldAutoCloseCompletedRoot(root) {
+		return
+	}
+
+	dependents, err := uw.DependencyUseCase().ListWithIssueMetadata(ctx, closedID, domain.DepListFilter{Direction: domain.DepDirectionIn})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not load steps of molecule %s for cascade close: %v\n", closedID, err)
+		return
+	}
+	params := domain.CloseIssueParams{Reason: "parent molecule closed", Session: session}
+	for _, dependent := range dependents {
+		if dependent.DependencyType != types.DepParentChild || dependent.Status == types.StatusClosed {
+			continue
+		}
+		child := dependent.Issue
+		var result domain.CloseIssueResult
+		if child.Ephemeral || child.NoHistory {
+			result, err = uw.IssueUseCase().CloseWisp(ctx, child.ID, params, actorName)
+		} else {
+			result, err = uw.IssueUseCase().CloseIssue(ctx, child.ID, params, actorName)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not cascade-close step %s of molecule %s: %v\n", child.ID, closedID, err)
+			continue
+		}
+		audit.LogFieldChange(child.ID, "status", string(child.Status), "closed", actorName, "parent molecule closed")
+		*outcomes = append(*outcomes, closeProxiedOutcome{id: child.ID, before: &child, after: result.Issue, closed: result.Closed})
+		cascadeCloseProxiedMoleculeChildren(ctx, uw, child.ID, actorName, session, outcomes, visited)
 	}
 }
 

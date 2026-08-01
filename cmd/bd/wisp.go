@@ -701,27 +701,32 @@ func runWispGC(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return HandleError("listing wisps: %v", err)
 	}
+	issueIDs := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		issueIDs = append(issueIDs, issue.ID)
+	}
+	_, _, parentOf, err := store.GetBlockingInfoForIssues(ctx, issueIDs)
+	if err != nil {
+		return HandleError("loading wisp parent relationships: %v", err)
+	}
 
-	// Find old/abandoned root wisps. Only open wisps are abandonable by age
-	// (with --all, closed too); in_progress/hooked/blocked/deferred/pinned
-	// wisps are actively in-flight or deliberately retained and are never
-	// candidates — nor is any wisp in the same molecule tree as one (enforced
-	// below via partitionDeletableWispTrees). This guards the 2026-06-19
-	// patrol-cascade failure, where age GC force-deleted a live molecule's
-	// in-progress step subtree.
+	// Find old/abandoned top-level wisps. A child is never an independent GC
+	// root: its ancestor owns the molecule's liveness decision even when that
+	// ancestor is protected, recent, or outside this query's result limit.
 	now := time.Now()
 	var roots []*types.Issue
 	byID := make(map[string]*types.Issue)
 	statusOf := make(map[string]types.Status)
 	for _, issue := range issues {
-		// Never GC infrastructure beads (configured via types.infra)
 		if store.IsInfraTypeCtx(ctx, issue.IssueType) {
 			continue
 		}
 		if !isAgeGCAbandonableRoot(issue.Status, cleanAll) {
 			continue
 		}
-		// Check if old (not updated within age threshold)
+		if _, hasParent := parentOf[issue.ID]; hasParent {
+			continue
+		}
 		if now.Sub(issue.UpdatedAt) > ageThreshold {
 			roots = append(roots, issue)
 			byID[issue.ID] = issue
@@ -729,48 +734,47 @@ func runWispGC(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Cascade: expand to include dependent step children of abandoned roots, so
-	// we can both clean up orphan-prone children and inspect the whole molecule
-	// tree for protected (live/retained) wisps before deleting anything.
 	rootIDs := make([]string, len(roots))
-	for i, r := range roots {
-		rootIDs[i] = r.ID
+	for i, root := range roots {
+		rootIDs[i] = root.ID
 	}
 	if len(rootIDs) > 0 {
 		childIDs, cascadeErr := store.FindWispDependentsRecursive(ctx, rootIDs)
 		if cascadeErr != nil {
-			// Log but don't fail the GC — partial cascade is better than none
-			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: cascade expansion incomplete: %v\n", cascadeErr)
+			return HandleError("expanding wisp GC candidates: %v", cascadeErr)
 		}
-		if len(childIDs) > 0 {
-			childIDSlice := make([]string, 0, len(childIDs))
-			for id := range childIDs {
-				if _, ok := statusOf[id]; !ok {
-					childIDSlice = append(childIDSlice, id)
-				}
+		childIDSlice := make([]string, 0, len(childIDs))
+		for id := range childIDs {
+			if _, known := statusOf[id]; !known {
+				childIDSlice = append(childIDSlice, id)
 			}
+		}
+		if len(childIDSlice) > 0 {
 			childIssues, fetchErr := store.GetIssuesByIDs(ctx, childIDSlice)
-			if fetchErr == nil {
-				for _, child := range childIssues {
-					// Never cascade to infra types
-					if store.IsInfraTypeCtx(ctx, child.IssueType) {
-						continue
-					}
-					byID[child.ID] = child
-					statusOf[child.ID] = child.Status
+			if fetchErr != nil {
+				return HandleError("loading wisp GC candidate statuses: %v", fetchErr)
+			}
+			fetched := make(map[string]bool, len(childIssues))
+			for _, child := range childIssues {
+				fetched[child.ID] = true
+				if store.IsInfraTypeCtx(ctx, child.IssueType) {
+					statusOf[child.ID] = types.StatusPinned
+					continue
+				}
+				byID[child.ID] = child
+				statusOf[child.ID] = child.Status
+			}
+			for _, id := range childIDSlice {
+				if !fetched[id] {
+					return HandleError("loading wisp GC candidate statuses: missing descendant %s", id)
 				}
 			}
 		}
 	}
 
-	// Decide what is actually deletable. Fast path: if no candidate is in a
-	// protected state, every fully-stale tree is dead and the whole set is
-	// collectible (the original behavior). Slow path: a protected wisp exists,
-	// so re-derive per-tree and shield any molecule tree containing live or
-	// retained work.
 	hasProtected := false
-	for _, st := range statusOf {
-		if isProtectedWispStatus(st) {
+	for _, status := range statusOf {
+		if isProtectedWispStatus(status) {
 			hasProtected = true
 			break
 		}
@@ -782,19 +786,22 @@ func runWispGC(cmd *cobra.Command, args []string) error {
 			deletableIDs = append(deletableIDs, id)
 		}
 	} else {
-		subtreeOf := func(root string) []string {
+		subtrees := make(map[string][]string, len(rootIDs))
+		for _, root := range rootIDs {
 			tree := []string{root}
-			deps, derr := store.FindWispDependentsRecursive(ctx, []string{root})
-			if derr != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: subtree expansion incomplete for %s: %v\n", root, derr)
+			deps, traversalErr := store.FindWispDependentsRecursive(ctx, []string{root})
+			if traversalErr != nil {
+				return HandleError("expanding wisp GC candidate %s: %v", root, traversalErr)
 			}
 			for id := range deps {
 				tree = append(tree, id)
 			}
-			return tree
+			subtrees[root] = tree
 		}
 		var protectedCount int
-		deletableIDs, protectedCount = partitionDeletableWispTrees(rootIDs, statusOf, subtreeOf)
+		deletableIDs, protectedCount = partitionDeletableWispTrees(rootIDs, statusOf, func(root string) []string {
+			return subtrees[root]
+		})
 		if protectedCount > 0 && !jsonOutput {
 			fmt.Printf("Protected %d wisp(s) in live molecule tree(s) from GC (in_progress/hooked/blocked/deferred/pinned)\n", protectedCount)
 		}

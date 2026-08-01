@@ -680,6 +680,57 @@ func TestProxiedServerClose(t *testing.T) {
 		}
 	})
 
+	t.Run("closing_molecule_cascades_to_open_steps", func(t *testing.T) {
+		p := bdProxiedInit(t, bd, "ccms")
+		root := bdProxiedCreate(t, bd, p.dir, "Molecule root", "-t", "epic", "--labels", "template")
+		step := bdProxiedCreate(t, bd, p.dir, "Open step", "--parent", root.ID)
+		bdProxiedClose(t, bd, p.dir, root.ID, "--force")
+		db := openProxiedDB(t, p)
+		if got := readStatus(t, db, step.ID); got != types.StatusClosed {
+			t.Errorf("open step should close with parent molecule, got %q", got)
+		}
+		if got := readCloseReason(t, db, step.ID); got != "parent molecule closed" {
+			t.Errorf("cascade close reason: got %q, want %q", got, "parent molecule closed")
+		}
+	})
+
+	t.Run("cascade_preserves_plain_epic_boundary", func(t *testing.T) {
+		p := bdProxiedInit(t, bd, "cpeb")
+		root := bdProxiedCreate(t, bd, p.dir, "Molecule root", "-t", "epic", "--labels", "template")
+		plainEpic := bdProxiedCreate(t, bd, p.dir, "Plain epic", "-t", "epic", "--parent", root.ID)
+		leaf := bdProxiedCreate(t, bd, p.dir, "Leaf under plain epic", "--parent", plainEpic.ID)
+		bdProxiedClose(t, bd, p.dir, root.ID, "--force")
+		db := openProxiedDB(t, p)
+		if got := readStatus(t, db, plainEpic.ID); got != types.StatusClosed {
+			t.Errorf("plain epic child should close with parent molecule, got %q", got)
+		}
+		if got := readStatus(t, db, leaf.ID); got != types.StatusOpen {
+			t.Errorf("leaf under plain epic should remain open, got %q", got)
+		}
+	})
+
+	t.Run("cascade_fires_close_hooks_for_steps", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("hook script form is POSIX shell")
+		}
+		marker := filepath.Join(t.TempDir(), "cascade_close_markers")
+		script := "#!/bin/sh\nprintf '%s\\n' \"$1\" >> " + shellQuote(marker) + "\n"
+		p := bdProxiedInitWithHooks(t, bd, "cfch", map[string]string{"on_close": script})
+		root := bdProxiedCreate(t, bd, p.dir, "Molecule root", "-t", "epic", "--labels", "template")
+		step := bdProxiedCreate(t, bd, p.dir, "Open step", "--parent", root.ID)
+		bdProxiedClose(t, bd, p.dir, root.ID, "--force")
+		data, err := os.ReadFile(marker)
+		if err != nil {
+			t.Fatalf("hook markers not written: %v", err)
+		}
+		output := string(data)
+		for _, id := range []string{root.ID, step.ID} {
+			if !strings.Contains(output, id) {
+				t.Errorf("hook marker missing %s; got: %q", id, output)
+			}
+		}
+	})
+
 	t.Run("hooks_fire_on_close", func(t *testing.T) {
 		marker := filepath.Join(t.TempDir(), "on_close_marker")
 		script := "#!/bin/sh\nprintf '%s\\n' \"$1\" > " + shellQuote(marker) + "\n"

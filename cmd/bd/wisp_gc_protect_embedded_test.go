@@ -35,6 +35,13 @@ func TestWispGCProtectsLiveMoleculeTrees(t *testing.T) {
 	bdDepAdd(t, bd, dir, liveSibling.ID, liveRoot.ID, "--type", "parent-child")
 	bdUpdate(t, bd, dir, liveActive.ID, "--status", "in_progress")
 
+	// Inverse live molecule: the protected node is the parent. Its stale open
+	// child must not be promoted to an independent GC root.
+	protectedRoot := bdCreate(t, bd, dir, "Protected parent molecule", "--ephemeral", "--type", "task")
+	protectedChild := bdCreate(t, bd, dir, "Stale child of protected parent", "--ephemeral", "--type", "task")
+	bdDepAdd(t, bd, dir, protectedChild.ID, protectedRoot.ID, "--type", "parent-child")
+	bdUpdate(t, bd, dir, protectedRoot.ID, "--status", "in_progress")
+
 	// Dead molecule: root + step, both open and abandoned. Must be collected.
 	deadRoot := bdCreate(t, bd, dir, "Dead molecule", "--ephemeral", "--type", "task")
 	deadStep := bdCreate(t, bd, dir, "Dead step", "--ephemeral", "--type", "task")
@@ -57,9 +64,11 @@ func TestWispGCProtectsLiveMoleculeTrees(t *testing.T) {
 	survivors := string(listOut)
 
 	mustSurvive := map[string]string{
-		liveRoot.ID:    "live molecule root",
-		liveActive.ID:  "in_progress step",
-		liveSibling.ID: "OPEN sibling of the in_progress step",
+		liveRoot.ID:       "live molecule root",
+		liveActive.ID:     "in_progress step",
+		liveSibling.ID:    "OPEN sibling of the in_progress step",
+		protectedRoot.ID:  "protected parent molecule",
+		protectedChild.ID: "OPEN child of a protected parent",
 	}
 	for id, desc := range mustSurvive {
 		if !strings.Contains(survivors, id) {
