@@ -128,6 +128,15 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 			WithArgs("wisp_dependencies").
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	}
+	if latest == 54 {
+		// The v54 pre-repair checks both candidate tables before applying direct
+		// generated-column DDL. This mocked world has neither table, so it no-ops.
+		for _, table := range []string{"issues", "wisps"} {
+			mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+				WithArgs(table).
+				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		}
+	}
 	mock.ExpectExec("(?s).*").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO schema_migrations (version, content_hash) VALUES (?, ?)")).

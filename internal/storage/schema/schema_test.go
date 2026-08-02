@@ -2,6 +2,7 @@ package schema
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/beads/internal/storage/depid"
 	"github.com/steveyegge/beads/internal/testutil"
 )
@@ -511,6 +513,37 @@ func TestFailed0053DirtyTablesRejectsWrongVersion(t *testing.T) {
 	}
 }
 
+func TestEnsureGCRouteIndexesAddsMissingSchema(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
+	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
+	indexQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.STATISTICS.*TABLE_NAME = \? AND INDEX_NAME = \?`
+	for _, table := range []string{"issues", "wisps"} {
+		mock.ExpectQuery(tableQuery).WithArgs(table).
+			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+		mock.ExpectQuery(columnQuery).WithArgs(table, "gc_routed_to_hash").
+			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+		mock.ExpectExec("ALTER TABLE " + table + " ADD COLUMN gc_routed_to_hash BINARY\\(32\\)").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery(indexQuery).WithArgs(table, "idx_"+table+"_gc_routed_to_hash").
+			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+		mock.ExpectExec("CREATE INDEX idx_" + table + "_gc_routed_to_hash ON " + table + " \\(gc_routed_to_hash, status\\)").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+	}
+
+	if err := ensureGCRouteIndexes(context.Background(), db); err != nil {
+		t.Fatalf("ensureGCRouteIndexes: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
 func TestPreMigrationRepairScopedToMain0053(t *testing.T) {
 	// The repair must not fire for other versions or for the ignored source
 	// (whose cursor table differs); nil DB proves no queries are attempted.
@@ -705,6 +738,57 @@ func TestMigration0047HandlesLegacyWispDependenciesShape(t *testing.T) {
 	}
 }
 
+func TestMigration0054AddsIndexedRouteHashes(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile("migrations/0054_add_gc_route_index.up.sql")
+	if err != nil {
+		t.Fatalf("read 0054 up migration: %v", err)
+	}
+	source := string(body)
+	for _, want := range []string{
+		"COLUMN_NAME = 'gc_routed_to_hash'",
+		"INDEX_NAME = 'idx_issues_gc_routed_to_hash'",
+		"INDEX_NAME = 'idx_wisps_gc_routed_to_hash'",
+		"JSON_EXTRACT(metadata, ''$.\"gc.routed_to\"'')",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("0054 source migration missing %q", want)
+		}
+	}
+
+	cli := cliCompatibleMigrationSQL("0054_add_gc_route_index.up.sql", source)
+	for _, want := range []string{
+		"ALTER TABLE issues ADD COLUMN gc_routed_to_hash BINARY(32)",
+		"UNHEX(SHA2(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.\"gc.routed_to\"')), 256))",
+		"CREATE INDEX idx_issues_gc_routed_to_hash ON issues (gc_routed_to_hash, status)",
+		"ALTER TABLE wisps ADD COLUMN gc_routed_to_hash BINARY(32)",
+		"CREATE INDEX idx_wisps_gc_routed_to_hash ON wisps (gc_routed_to_hash, status)",
+	} {
+		if !strings.Contains(cli, want) {
+			t.Fatalf("0054 CLI migration missing %q", want)
+		}
+	}
+}
+
+func TestIgnoredMigration0012AddsWispRouteHash(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile("migrations/ignored/0012_add_gc_route_index.up.sql")
+	if err != nil {
+		t.Fatalf("read ignored 0012 up migration: %v", err)
+	}
+	for _, want := range []string{
+		"TABLE_NAME = 'wisps'",
+		"COLUMN_NAME = 'gc_routed_to_hash'",
+		"INDEX_NAME = 'idx_wisps_gc_routed_to_hash'",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("ignored 0012 migration missing %q", want)
+		}
+	}
+}
+
 func TestCLICompatibleMigration0046UsesFreshSchemaDDLOnly(t *testing.T) {
 	got := cliCompatibleMigrationSQL("0046_add_is_blocked.up.sql", "source migration")
 	for _, want := range []string{
@@ -849,6 +933,88 @@ WHERE table_schema = DATABASE()
 	requireDoltColumnShape(t, dir, "wisps", "no_history", "tinyint(1)", "YES")
 	requireDoltColumnShape(t, dir, "wisps", "started_at", "datetime", "YES")
 	requireDoltColumnShape(t, dir, "wisps", "wisp_type", "varchar(32)", "YES")
+}
+
+func TestRuntimeMigrationV53ToV54AddsRouteIndexes(t *testing.T) {
+	port := testutil.StartIsolatedDoltContainer(t)
+	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/beads_test?multiStatements=true&parseTime=true", port)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open Dolt test database: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("ping Dolt test database: %v", err)
+	}
+
+	if _, err := MigrateUpTo(ctx, db, 53); err != nil {
+		t.Fatalf("migrate fresh database to v53: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_ADD('-A'); CALL DOLT_COMMIT('-m', 'schema: v53 fixture')"); err != nil {
+		t.Fatalf("commit v53 fixture: %v", err)
+	}
+	if _, err := MigrateUp(ctx, db); err != nil {
+		t.Fatalf("runtime migrate v53 to v54: %v", err)
+	}
+
+	for _, table := range []string{"issues", "wisps"} {
+		var count int
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+			WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?
+		`, table, "idx_"+table+"_gc_routed_to_hash").Scan(&count); err != nil {
+			t.Fatalf("query %s route index: %v", table, err)
+		}
+		if count != 2 {
+			t.Fatalf("%s route index column count = %d, want 2", table, count)
+		}
+	}
+}
+
+func TestRouteHashIndexesPreserveLongMetadataAndDrivePlans(t *testing.T) {
+	testutil.RequireDoltBinary(t)
+
+	dir := filepath.Join(t.TempDir(), "route-hash")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create route-hash dir: %v", err)
+	}
+	runDoltCommand(t, dir, "init", "--name", "test", "--email", "test@example.com")
+	runDoltSQL(t, dir, AllMigrationsSQL())
+	runDoltSQL(t, dir, `
+INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata)
+VALUES ('route-issue', 'route issue', '', '', '', '', 'open', 2, 'task', JSON_OBJECT('gc.routed_to', REPEAT('x', 1000)));
+INSERT INTO wisps (id, title, status, priority, issue_type, metadata)
+VALUES ('route-wisp', 'route wisp', 'open', 2, 'task', JSON_OBJECT('gc.routed_to', REPEAT('x', 1000)));
+`)
+
+	for _, table := range []string{"issues", "wisps"} {
+		requireDoltCount(t, dir, fmt.Sprintf(`
+SELECT COUNT(*) AS c FROM %s
+WHERE gc_routed_to_hash = UNHEX(SHA2(REPEAT('x', 1000), 256))
+  AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$."gc.routed_to"')) = REPEAT('x', 1000)
+  AND status = 'open'`, table), "1")
+		requireDoltCount(t, dir, fmt.Sprintf(`
+SELECT COUNT(*) AS c FROM %s
+WHERE gc_routed_to_hash = UNHEX(SHA2(CONCAT(REPEAT('x', 1000), ' '), 256))
+  AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$."gc.routed_to"')) = CONCAT(REPEAT('x', 1000), ' ')
+  AND status = 'open'`, table), "0")
+
+		rows := queryDoltCSV(t, dir, fmt.Sprintf(`
+EXPLAIN FORMAT=tree SELECT id FROM %s
+WHERE gc_routed_to_hash = UNHEX(SHA2(REPEAT('x', 1000), 256))
+  AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$."gc.routed_to"')) = REPEAT('x', 1000)
+  AND status = 'open'`, table))
+		var plan strings.Builder
+		for _, row := range rows {
+			plan.WriteString(row["plan"])
+			plan.WriteByte('\n')
+		}
+		indexName := "idx_" + table + "_gc_routed_to_hash"
+		if got := plan.String(); !strings.Contains(got, "gc_routed_to_hash") || !strings.Contains(got, "IndexedTableAccess") {
+			t.Fatalf("%s EXPLAIN did not use %s:\n%s", table, indexName, got)
+		}
+	}
 }
 
 func runDoltCommand(t *testing.T, dir string, args ...string) {

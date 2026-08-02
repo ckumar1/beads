@@ -257,6 +257,14 @@ func AppendMetadataClauses(where []string, args []any, hasKey string, fields map
 			if err := storage.ValidateMetadataKey(k); err != nil {
 				return nil, nil, err
 			}
+			if k == "gc.routed_to" {
+				// Route discovery is Gas City's hottest metadata query. The generated
+				// SHA-256 column narrows through a fixed-width index without imposing
+				// a length limit on arbitrary JSON values. Keep the JSON equality as a
+				// collision-safe semantic check.
+				where = append(where, "gc_routed_to_hash = UNHEX(SHA2(?, 256))")
+				args = append(args, fields[k])
+			}
 			where = append(where, "JSON_UNQUOTE(JSON_EXTRACT(metadata, ?)) = ?")
 			args = append(args, storage.JSONMetadataPath(k), fields[k])
 		}

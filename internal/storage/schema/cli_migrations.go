@@ -49,6 +49,10 @@ func cliCompatibleMigrationSQL(name, sqlText string) string {
 		// bundles already have the base wisp tables, and the Dolt CLI test
 		// path needs direct DML for deterministic fixture repair.
 		return cliMigration0053RepairRigWisps
+	case "0054_add_gc_route_index.up.sql":
+		// The Dolt CLI bundle does not reliably apply prepared generated-column
+		// ALTERs. Fresh schemas always need both tables, so emit direct DDL.
+		return cliMigration0054AddGCRouteIndex
 	default:
 		return sqlText
 	}
@@ -131,6 +135,10 @@ ALTER TABLE comments ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE issue_snapshots ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE compaction_snapshots ALTER COLUMN id DROP DEFAULT;`
 
+const cliMigration0054AddGCRouteIndex = `ALTER TABLE issues ADD COLUMN gc_routed_to_hash BINARY(32) AS (UNHEX(SHA2(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$."gc.routed_to"')), 256))) STORED;
+CREATE INDEX idx_issues_gc_routed_to_hash ON issues (gc_routed_to_hash, status);
+ALTER TABLE wisps ADD COLUMN gc_routed_to_hash BINARY(32) AS (UNHEX(SHA2(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$."gc.routed_to"')), 256))) STORED;
+CREATE INDEX idx_wisps_gc_routed_to_hash ON wisps (gc_routed_to_hash, status);`
 const cliMigration0053RepairRigWisps = `SET FOREIGN_KEY_CHECKS = 0;
 
 INSERT IGNORE INTO issues (

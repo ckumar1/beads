@@ -135,6 +135,52 @@ func TestBuildReadyWorkWhereFiltersAnyLabel(t *testing.T) {
 	}
 }
 
+func TestAppendMetadataClausesUsesIndexedRouteHash(t *testing.T) {
+	t.Parallel()
+
+	where, args, err := AppendMetadataClauses(nil, nil, "", map[string]string{"gc.routed_to": "worker"})
+	if err != nil {
+		t.Fatalf("AppendMetadataClauses: %v", err)
+	}
+	joined := strings.Join(where, " AND ")
+	for _, want := range []string{
+		"gc_routed_to_hash = UNHEX(SHA2(?, 256))",
+		"JSON_UNQUOTE(JSON_EXTRACT(metadata, ?)) = ?",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("where = %q, want indexed route predicate %q", joined, want)
+		}
+	}
+	wantArgs := []any{"worker", `$."gc.routed_to"`, "worker"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %#v, want %#v", args, wantArgs)
+	}
+	for i := range wantArgs {
+		if args[i] != wantArgs[i] {
+			t.Fatalf("args[%d] = %#v, want %#v; all args = %#v", i, args[i], wantArgs[i], args)
+		}
+	}
+}
+
+func TestAppendMetadataClausesKeepsGenericMetadataPredicate(t *testing.T) {
+	t.Parallel()
+
+	where, args, err := AppendMetadataClauses(nil, nil, "", map[string]string{"team": "platform"})
+	if err != nil {
+		t.Fatalf("AppendMetadataClauses: %v", err)
+	}
+	joined := strings.Join(where, " AND ")
+	if strings.Contains(joined, "gc_routed_to_hash") {
+		t.Fatalf("generic metadata predicate unexpectedly uses route index: %q", joined)
+	}
+	if !strings.Contains(joined, "JSON_UNQUOTE(JSON_EXTRACT(metadata, ?)) = ?") {
+		t.Fatalf("where = %q, want generic JSON predicate", joined)
+	}
+	if len(args) != 2 || args[0] != `$.team` || args[1] != "platform" {
+		t.Fatalf("args = %#v, want [$.team platform]", args)
+	}
+}
+
 func TestSearchCountsSQLShape(t *testing.T) {
 	t.Parallel()
 

@@ -23,6 +23,12 @@ func (m migrationSource) preMigrationRepair(ctx context.Context, db DBConn, vers
 		}
 		return ensureWispDependenciesSplitTargets(ctx, db)
 	}
+	if m.cursorTable == "schema_migrations" && version == 54 {
+		return ensureGCRouteIndexes(ctx, db)
+	}
+	if m.cursorTable == "ignored_schema_migrations" && version == 12 {
+		return ensureGCRouteIndexes(ctx, db)
+	}
 	return nil
 }
 
@@ -125,6 +131,44 @@ func wispDependenciesSplitTargetBackfillSQL() []string {
 	}
 }
 
+const gcRouteHashColumnDefinition = `BINARY(32) AS (UNHEX(SHA2(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$."gc.routed_to"')), 256))) STORED`
+
+// ensureGCRouteIndexes applies migration 0054's generated columns with direct
+// DDL. Dolt accepts generated-column ALTERs through direct execution but can
+// silently skip the same ALTER inside PREPARE; the migration file retains
+// idempotent guards and becomes a no-op after this repair establishes schema.
+func ensureGCRouteIndexes(ctx context.Context, db DBConn) error {
+	for _, table := range []string{"issues", "wisps"} {
+		exists, err := schemaTableExists(ctx, db, table)
+		if err != nil {
+			return fmt.Errorf("checking %s table for migration 0054: %w", table, err)
+		}
+		if !exists {
+			continue
+		}
+		columnPresent, err := schemaColumnExists(ctx, db, table, "gc_routed_to_hash")
+		if err != nil {
+			return fmt.Errorf("checking %s.gc_routed_to_hash: %w", table, err)
+		}
+		if !columnPresent {
+			if _, err := db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN gc_routed_to_hash "+gcRouteHashColumnDefinition); err != nil {
+				return fmt.Errorf("adding %s.gc_routed_to_hash for migration 0054: %w", table, err)
+			}
+		}
+		indexName := "idx_" + table + "_gc_routed_to_hash"
+		indexPresent, err := schemaIndexExists(ctx, db, table, indexName)
+		if err != nil {
+			return fmt.Errorf("checking %s.%s: %w", table, indexName, err)
+		}
+		if !indexPresent {
+			if _, err := db.ExecContext(ctx, "CREATE INDEX "+indexName+" ON "+table+" (gc_routed_to_hash, status)"); err != nil {
+				return fmt.Errorf("adding %s for migration 0054: %w", indexName, err)
+			}
+		}
+	}
+	return nil
+}
+
 func schemaTableExists(ctx context.Context, db DBConn, table string) (bool, error) {
 	var count int
 	if err := db.QueryRowContext(ctx, `
@@ -142,6 +186,17 @@ func schemaColumnExists(ctx context.Context, db DBConn, table, column string) (b
 		SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
 		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
 	`, table, column).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func schemaIndexExists(ctx context.Context, db DBConn, table, index string) (bool, error) {
+	var count int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?
+	`, table, index).Scan(&count); err != nil {
 		return false, err
 	}
 	return count > 0, nil
