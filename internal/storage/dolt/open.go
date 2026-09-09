@@ -334,17 +334,31 @@ func applyResolvedConfig(ctx context.Context, beadsDir string, fileCfg *configfi
 	// (10s, see buildServerDSN). The default fast-fail is right for healthy
 	// local servers; overloaded shared-server deployments raise it so ordinary
 	// queries stop dying with "i/o timeout" under load (bd-vz0y9).
+	//
+	// The config.yaml rung needs both reads: config.GetString reads a
+	// package-global viper populated only by cmd/bd's config.Initialize(), so
+	// for a library consumer it always returns "" and the project's configured
+	// deadlines were silently ignored — the process ran the 10s default
+	// whatever the file said. Fall back to a direct read of the project's
+	// config.yaml, the same fallback dolt.auto-start carries above for this
+	// exact hole.
+	poolTimeoutCfg := func(key string) string {
+		if v := config.GetString(key); v != "" {
+			return v
+		}
+		return config.GetStringFromDir(beadsDir, key)
+	}
 	if cfg.PoolReadTimeout == 0 {
 		cfg.PoolReadTimeout = timeoutFromEnv("BEADS_DOLT_POOL_READ_TIMEOUT", 0)
 	}
 	if cfg.PoolReadTimeout == 0 {
-		cfg.PoolReadTimeout = parseTimeout(config.GetString("dolt.pool-read-timeout"), 0)
+		cfg.PoolReadTimeout = parseTimeout(poolTimeoutCfg("dolt.pool-read-timeout"), 0)
 	}
 	if cfg.PoolWriteTimeout == 0 {
 		cfg.PoolWriteTimeout = timeoutFromEnv("BEADS_DOLT_POOL_WRITE_TIMEOUT", 0)
 	}
 	if cfg.PoolWriteTimeout == 0 {
-		cfg.PoolWriteTimeout = parseTimeout(config.GetString("dolt.pool-write-timeout"), 0)
+		cfg.PoolWriteTimeout = parseTimeout(poolTimeoutCfg("dolt.pool-write-timeout"), 0)
 	}
 
 	return nil
