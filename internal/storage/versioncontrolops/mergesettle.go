@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/kvkeys"
+	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
 // memoryConfigKeyPrefix is the config-table key prefix under which `bd remember`
@@ -345,10 +346,17 @@ func MergeWithStrategy(ctx context.Context, db DBConn, ref, author, strategy str
 // the merge ran. The most common reason --abort fails is a merge that
 // REFUSED TO START on a dirty working set; hard-resetting there would
 // destroy uncommitted data the merge never touched (bd-578h9.2).
-// Best-effort: the caller's error is what matters.
+// Best-effort: the caller's error is what matters, so a failed reset stays
+// silent. But a reset that SUCCEEDED and then could not re-link the
+// clone-local FKs it dropped (bd-7bpkd, ga-28co77) has left enforcement off
+// on those tables, so that is reported on stderr like this file's other
+// recovery notices rather than lost.
 func abortMerge(ctx context.Context, db DBConn, preMergeClean bool) {
 	if _, err := db.ExecContext(ctx, "CALL DOLT_MERGE('--abort')"); err != nil && preMergeClean {
-		_, _ = db.ExecContext(ctx, "CALL DOLT_RESET('--hard')")
+		var relinkErr *schema.CloneLocalFKRelinkError
+		if resetErr := resetHardPreservingCloneLocalFKs(ctx, db, ""); errors.As(resetErr, &relinkErr) {
+			fmt.Fprintf(os.Stderr, "Warning: merge abort recovery: %v\n", resetErr)
+		}
 	}
 }
 

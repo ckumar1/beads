@@ -72,8 +72,10 @@ func Compact(ctx context.Context, conn DBConn, initialHash, boundaryHash string,
 	if err := execSQL("checkout main", "CALL DOLT_CHECKOUT('main')"); err != nil {
 		return err
 	}
-	if err := execSQL("reset main to compacted", "CALL DOLT_RESET('--hard', 'compact-tmp')"); err != nil {
-		return err
+	// bd-7bpkd / ga-28co77: the hard reset drops every clone-local FK; the
+	// helper re-links the ones it dropped, on this same session.
+	if err := resetHardPreservingCloneLocalFKs(ctx, conn, "compact-tmp"); err != nil {
+		return fmt.Errorf("compact step %q: %w", "reset main to compacted", err)
 	}
 	if err := execSQL("delete temp branch", "CALL DOLT_BRANCH('-D', 'compact-tmp')"); err != nil {
 		return err

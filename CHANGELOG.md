@@ -33,6 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already refused the combination. Both routes now fail with the same
   `--format cannot be combined with --watch` usage error.
 
+- **Hard resets no longer strip the foreign keys from clone-local tables**
+  (bd-7bpkd, ga-28co77). `CALL DOLT_RESET('--hard')` silently drops every
+  foreign key on every dolt_ignored table (`events` and the `wisp_*` aux
+  tables), and nothing but `bd doctor --fix` re-added them, so every
+  `bd flatten`, `bd compact`, merge-abort recovery and fresh-bootstrap heal
+  turned enforcement off for good and let orphan rows pile up. Every one of
+  those resets now goes through one helper that re-links, on the same
+  session, each clone-local FK the reset dropped, after deleting only the rows
+  that reset itself orphaned. A foreign key that was already missing before
+  the reset is left alone (its orphans can number in the hundreds of
+  thousands) and is named in a warning that points at `bd doctor --fix`. If a
+  re-link fails, the command errors, says the reset succeeded, and names the
+  constraint. The FK spec and relink code moved from the doctor to
+  `internal/storage/schema`; `bd doctor` behaves as before.
+
 - **The smart migrate gate no longer auto-migrates a clone whose data is behind
   the remote, and `bd dolt pull` now works from that state**
   ([#6575](https://github.com/gastownhall/beads/issues/6575)). The gate's

@@ -2,7 +2,10 @@ package versioncontrolops
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
 // Flatten squashes all Dolt commit history into a single commit using
@@ -58,14 +61,29 @@ func Flatten(ctx context.Context, conn DBConn) error {
 		{"soft reset to initial", "CALL DOLT_RESET('--soft', ?)", []interface{}{initialHash}},
 		{"commit flattened snapshot", "CALL DOLT_COMMIT('-Am', 'flatten: squash all history into single commit')", nil},
 		{"checkout main", "CALL DOLT_CHECKOUT('main')", nil},
-		{"reset main to flattened", "CALL DOLT_RESET('--hard', 'flatten-tmp')", nil},
-		{"delete temp branch", "CALL DOLT_BRANCH('-D', 'flatten-tmp')", nil},
 	}
 
 	for _, s := range steps {
 		if err := execSQL(s.name, s.query, s.args...); err != nil {
 			return err
 		}
+	}
+
+	// bd-7bpkd / ga-28co77: the hard reset drops every clone-local FK; the
+	// helper re-links the ones it dropped, on this same session. A re-link
+	// failure still means main was reset, so the temp branch is deleted
+	// before the failure is returned — a leftover flatten-tmp would block
+	// every later flatten at "create temp branch".
+	resetErr := resetHardPreservingCloneLocalFKs(ctx, conn, "flatten-tmp")
+	var relinkErr *schema.CloneLocalFKRelinkError
+	if resetErr != nil && !errors.As(resetErr, &relinkErr) {
+		return fmt.Errorf("flatten step %q: %w", "reset main to flattened", resetErr)
+	}
+	if err := execSQL("delete temp branch", "CALL DOLT_BRANCH('-D', 'flatten-tmp')"); err != nil {
+		return errors.Join(err, resetErr)
+	}
+	if resetErr != nil {
+		return fmt.Errorf("flatten step %q: %w", "reset main to flattened", resetErr)
 	}
 
 	return nil
