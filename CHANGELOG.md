@@ -45,8 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reset is left alone (its orphans can number in the hundreds of
   thousands) and is named in a warning that points at `bd doctor --fix`. If a
   re-link fails, the command errors, says the reset succeeded, and names the
-  constraint. The FK spec and relink code moved from the doctor to
-  `internal/storage/schema`; `bd doctor` behaves as before.
+  constraint (if the FKs cannot even be re-read after the reset, it says their
+  state is unknown instead). The FK spec and relink code moved from the doctor
+  to `internal/storage/schema`; `bd doctor` behaves as before.
+
+  Three things to know. The DELETE removes *every* orphan of an FK the reset
+  dropped; that is exactly "the rows the reset orphaned" only when the FK was
+  enforcing before it (bd writes cross-tier wisp dependencies under
+  `foreign_key_checks = 0`, so an older orphan can go too). Each dropped FK
+  costs an anti-join DELETE plus the `ADD CONSTRAINT` validation scan of its
+  table, on every reset. And nothing enforces the FK between that DELETE and
+  the `ADD CONSTRAINT`, so an orphan another session inserts in that window
+  makes the re-link fail: `bd compact`/`bd flatten` then report the
+  reset-succeeded error, with their temp branch still cleaned up.
 
 - **The smart migrate gate no longer auto-migrates a clone whose data is behind
   the remote, and `bd dolt pull` now works from that state**

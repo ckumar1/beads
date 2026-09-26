@@ -2,6 +2,7 @@ package schema
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -113,7 +114,7 @@ func ScanSeveredCloneLocalFKs(ctx context.Context, db DBConn) ([]SeveredCloneLoc
 		var orphans int
 		//nolint:gosec // G201: identifiers come from the fixed CloneLocalFKs spec above, not user input.
 		orphanCount := fmt.Sprintf(
-			`SELECT COUNT(*) FROM %s t WHERE t.%s IS NOT NULL AND NOT EXISTS (SELECT 1 FROM %s r WHERE r.%s = t.%s)`,
+			"SELECT COUNT(*) FROM `%s` t WHERE t.`%s` IS NOT NULL AND NOT EXISTS (SELECT 1 FROM `%s` r WHERE r.`%s` = t.`%s`)",
 			fk.Table, fk.Column, fk.RefTable, fk.RefColumn, fk.Column,
 		)
 		if err := db.QueryRowContext(ctx, orphanCount).Scan(&orphans); err != nil {
@@ -130,13 +131,15 @@ func ScanSeveredCloneLocalFKs(ctx context.Context, db DBConn) ([]SeveredCloneLoc
 // against the current tracked root and enforces again. It returns how many
 // orphaned rows were removed.
 //
-// The DELETE is bounded to fk's own orphans, but on a store severed for months
-// that can be hundreds of thousands of rows: only `bd doctor --fix` and a
-// just-severed FK (ResetHardPreservingCloneLocalFKs) may call this.
+// The DELETE removes EVERY row of fk's table that violates fk, however it got
+// there. On a store severed for months that can be hundreds of thousands of
+// rows: only `bd doctor --fix` and a just-dropped FK
+// (ResetHardPreservingCloneLocalFKs) may call this. Identifiers come from the
+// fixed spec and are backtick-quoted anyway.
 func RelinkCloneLocalFK(ctx context.Context, db DBConn, fk CloneLocalFK) (removed int64, err error) {
 	//nolint:gosec // G201: identifiers come from the fixed CloneLocalFKs spec, not user input.
 	deleteOrphans := fmt.Sprintf(
-		`DELETE FROM %s WHERE %s IS NOT NULL AND NOT EXISTS (SELECT 1 FROM %s r WHERE r.%s = %s.%s)`,
+		"DELETE FROM `%s` WHERE `%s` IS NOT NULL AND NOT EXISTS (SELECT 1 FROM `%s` r WHERE r.`%s` = `%s`.`%s`)",
 		fk.Table, fk.Column, fk.RefTable, fk.RefColumn, fk.Table, fk.Column,
 	)
 	result, err := db.ExecContext(ctx, deleteOrphans)
@@ -147,7 +150,7 @@ func RelinkCloneLocalFK(ctx context.Context, db DBConn, fk CloneLocalFK) (remove
 
 	//nolint:gosec // G201: identifiers come from the fixed CloneLocalFKs spec, not user input.
 	addConstraint := fmt.Sprintf(
-		`ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s) ON DELETE CASCADE ON UPDATE CASCADE`,
+		"ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`) ON DELETE CASCADE ON UPDATE CASCADE",
 		fk.Table, fk.Constraint, fk.Column, fk.RefTable, fk.RefColumn,
 	)
 	if _, err := db.ExecContext(ctx, addConstraint); err != nil {
@@ -155,6 +158,11 @@ func RelinkCloneLocalFK(ctx context.Context, db DBConn, fk CloneLocalFK) (remove
 	}
 	return removed, nil
 }
+
+// ErrHardResetNotRun marks a ResetHardPreservingCloneLocalFKs failure that
+// happened before the reset: nothing was reset. Best-effort recovery callers
+// (abortMerge) fall back to a bare reset on it.
+var ErrHardResetNotRun = errors.New("hard reset not run")
 
 // RelinkedCloneLocalFK is a constraint a hard reset dropped and
 // ResetHardPreservingCloneLocalFKs re-added, with the number of rows the
@@ -200,14 +208,30 @@ type CloneLocalFKRelinkFailure struct {
 	Err error
 }
 
-// CloneLocalFKRelinkError means the hard reset SUCCEEDED but one or more
-// clone-local FKs it dropped could not be re-linked: enforcement on them is
-// off until `bd doctor --fix` runs.
+// CloneLocalFKRelinkError means the hard reset SUCCEEDED but the clone-local
+// FKs are not known to be restored. Either:
+//
+//   - Failures: FKs the reset is confirmed to have dropped whose re-link
+//     failed — enforcement on them is off until `bd doctor --fix` runs; or
+//   - VerifyErr: the post-reset probe failed, so whether the reset dropped any
+//     of Unverified (the FKs present before it) is UNKNOWN.
 type CloneLocalFKRelinkError struct {
-	Failures []CloneLocalFKRelinkFailure
+	Failures   []CloneLocalFKRelinkFailure
+	Unverified []CloneLocalFK
+	VerifyErr  error
 }
 
 func (e *CloneLocalFKRelinkError) Error() string {
+	if e.VerifyErr != nil {
+		names := make([]string, 0, len(e.Unverified))
+		for _, fk := range e.Unverified {
+			names = append(names, fk.String())
+		}
+		return fmt.Sprintf("hard reset succeeded, but could not verify the clone-local foreign keys afterwards (%v): "+
+			"whether it dropped any of the %d present before it (%s) is unknown; "+
+			"run 'bd doctor' to check them and 'bd doctor --fix' to re-link any that are missing",
+			e.VerifyErr, len(names), strings.Join(names, ", "))
+	}
 	parts := make([]string, 0, len(e.Failures))
 	for _, f := range e.Failures {
 		parts = append(parts, fmt.Sprintf("%s: %v", f.FK, f.Err))
@@ -218,7 +242,10 @@ func (e *CloneLocalFKRelinkError) Error() string {
 }
 
 func (e *CloneLocalFKRelinkError) Unwrap() []error {
-	errs := make([]error, 0, len(e.Failures))
+	errs := make([]error, 0, len(e.Failures)+1)
+	if e.VerifyErr != nil {
+		errs = append(errs, e.VerifyErr)
+	}
 	for _, f := range e.Failures {
 		errs = append(errs, f.Err)
 	}
@@ -231,8 +258,22 @@ func (e *CloneLocalFKRelinkError) Unwrap() []error {
 //  1. read which clone-local FKs are present before the reset;
 //  2. run the reset;
 //  3. for each FK present before and missing after, delete THAT FK's orphans
-//     (rows the reset itself orphaned — e.g. events rows whose issue the reset
-//     removed) and re-add the constraint exactly as `bd doctor --fix` does.
+//     and re-add the constraint exactly as `bd doctor --fix` does.
+//
+// The DELETE removes every orphan of an FK the reset dropped. That equals
+// "the rows the reset orphaned" (e.g. events rows whose issue the reset
+// removed) only if the FK was actually enforcing before the reset; a write
+// made under foreign_key_checks = 0 (dolt/transaction.go does so for
+// cross-tier wisp dependencies) can leave an older orphan that goes too.
+//
+// Cost: every FK the reset drops costs an anti-join DELETE plus the ADD
+// CONSTRAINT's validation scan of its table, on every reset, even with no
+// orphans.
+//
+// Race: nothing enforces the FK between the DELETE and the ALTER, so an orphan
+// another session inserts in that window makes the ALTER fail; the caller
+// then gets the reset-succeeded error below (compact and flatten still clean
+// up their temp branch).
 //
 // An FK already missing before the reset is not touched; it is listed in
 // Result.AlreadySevered for the caller to surface.
@@ -242,16 +283,18 @@ func (e *CloneLocalFKRelinkError) Unwrap() []error {
 // must all see the same branch and working set. A *sql.DB pool could run the
 // ALTER on another connection — another session, possibly another branch.
 //
-// Errors: if the pre-reset probe fails, the reset is not run. A reset failure
-// is returned as-is. If the reset succeeds and any re-link fails, the error is
-// a *CloneLocalFKRelinkError naming each FK; the helper still attempts every
-// other FK first.
+// Errors: if the pre-reset probe fails, the reset is not run and the error
+// wraps ErrHardResetNotRun. A reset failure is returned as-is. If the reset
+// succeeds and any re-link fails, the error is a *CloneLocalFKRelinkError
+// naming each FK; the helper still attempts every other FK first. If the
+// reset succeeds and the post-reset probe fails, it is a
+// *CloneLocalFKRelinkError whose VerifyErr is set: the FK state is unknown.
 func ResetHardPreservingCloneLocalFKs(ctx context.Context, conn DBConn, target string) (ResetHardResult, error) {
 	var result ResetHardResult
 
 	before, err := readCloneLocalFKState(ctx, conn)
 	if err != nil {
-		return result, fmt.Errorf("read clone-local foreign keys before hard reset (reset not run): %w", err)
+		return result, fmt.Errorf("%w: could not read clone-local foreign keys first: %w", ErrHardResetNotRun, err)
 	}
 	result.AlreadySevered = before.severed
 
@@ -270,16 +313,18 @@ func ResetHardPreservingCloneLocalFKs(ctx context.Context, conn DBConn, target s
 		return result, nil
 	}
 
-	var failures []CloneLocalFKRelinkFailure
 	after, err := readCloneLocalFKState(ctx, conn)
 	if err != nil {
+		var unverified []CloneLocalFK
 		for _, fk := range CloneLocalFKs {
 			if before.present[fk] {
-				failures = append(failures, CloneLocalFKRelinkFailure{FK: fk, Err: fmt.Errorf("read state after reset: %w", err)})
+				unverified = append(unverified, fk)
 			}
 		}
-		return result, &CloneLocalFKRelinkError{Failures: failures}
+		return result, &CloneLocalFKRelinkError{Unverified: unverified, VerifyErr: err}
 	}
+
+	var failures []CloneLocalFKRelinkFailure
 
 	for _, fk := range CloneLocalFKs {
 		if !before.present[fk] || after.present[fk] {

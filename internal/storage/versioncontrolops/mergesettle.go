@@ -347,16 +347,25 @@ func MergeWithStrategy(ctx context.Context, db DBConn, ref, author, strategy str
 // REFUSED TO START on a dirty working set; hard-resetting there would
 // destroy uncommitted data the merge never touched (bd-578h9.2).
 // Best-effort: the caller's error is what matters, so a failed reset stays
-// silent. But a reset that SUCCEEDED and then could not re-link the
-// clone-local FKs it dropped (bd-7bpkd, ga-28co77) has left enforcement off
-// on those tables, so that is reported on stderr like this file's other
-// recovery notices rather than lost.
+// silent. The reset re-links the clone-local FKs it drops (bd-7bpkd,
+// ga-28co77), and two outcomes of that are reported on stderr like this
+// file's other recovery notices rather than lost:
+//   - the FK probe failed, so the helper did not reset: recovery still must
+//     happen, so fall back to the bare reset and say it may leave FKs severed;
+//   - the reset SUCCEEDED but the FKs could not be re-linked (or verified).
 func abortMerge(ctx context.Context, db DBConn, preMergeClean bool) {
-	if _, err := db.ExecContext(ctx, "CALL DOLT_MERGE('--abort')"); err != nil && preMergeClean {
-		var relinkErr *schema.CloneLocalFKRelinkError
-		if resetErr := resetHardPreservingCloneLocalFKs(ctx, db, ""); errors.As(resetErr, &relinkErr) {
-			fmt.Fprintf(os.Stderr, "Warning: merge abort recovery: %v\n", resetErr)
-		}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_MERGE('--abort')"); err == nil || !preMergeClean {
+		return
+	}
+	resetErr := resetHardPreservingCloneLocalFKs(ctx, db, "")
+	var relinkErr *schema.CloneLocalFKRelinkError
+	switch {
+	case errors.Is(resetErr, schema.ErrHardResetNotRun):
+		fmt.Fprintf(os.Stderr, "Warning: merge abort recovery: %v; falling back to a bare hard reset, "+
+			"which leaves any clone-local foreign key it drops severed until 'bd doctor --fix'\n", resetErr)
+		_, _ = db.ExecContext(ctx, "CALL DOLT_RESET('--hard')")
+	case errors.As(resetErr, &relinkErr):
+		fmt.Fprintf(os.Stderr, "Warning: merge abort recovery: %v\n", resetErr)
 	}
 }
 

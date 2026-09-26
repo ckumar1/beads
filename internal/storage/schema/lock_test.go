@@ -770,9 +770,9 @@ func TestMigrateUpWithLockFreshBootstrapHealRelinksCloneLocalFKs(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	expectCloneLocalFKProbe(mock, true, false)
-	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM events WHERE issue_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM issues r WHERE r.id = events.issue_id)")).
+	mock.ExpectExec("DELETE FROM `?events`? WHERE `?issue_id`? IS NOT NULL AND NOT EXISTS \\(SELECT 1 FROM `?issues`? r WHERE r\\.`?id`? = `?events`?\\.`?issue_id`?\\)").
 		WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectExec(regexp.QuoteMeta("ALTER TABLE events ADD CONSTRAINT fk_events_issue FOREIGN KEY (issue_id) REFERENCES issues (id) ON DELETE CASCADE ON UPDATE CASCADE")).
+	mock.ExpectExec("ALTER TABLE `?events`? ADD CONSTRAINT `?fk_events_issue`? FOREIGN KEY \\(`?issue_id`?\\) REFERENCES `?issues`? \\(`?id`?\\) ON DELETE CASCADE ON UPDATE CASCADE").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectOnePendingMigration(t, mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
@@ -786,6 +786,70 @@ func TestMigrateUpWithLockFreshBootstrapHealRelinksCloneLocalFKs(t *testing.T) {
 	}
 	if applied != 1 {
 		t.Fatalf("MigrateUpWithLock() applied = %d, want 1", applied)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// TestMigrateUpWithLockFreshBootstrapHealRelinkFailureStopsAndReleasesLock
+// pins the heal path's relink-failure contract (bd-7bpkd, ga-28co77): the
+// reset succeeded, so the error says so, names the FK and carries the
+// injected cause, drops the stale DirtyTablesError, does NOT re-run the
+// migration pass, and still releases the lock.
+func TestMigrateUpWithLockFreshBootstrapHealRelinkFailureStopsAndReleasesLock(t *testing.T) {
+	failOnSwallowedAdvisory(t)
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin mock connection: %v", err)
+	}
+	defer conn.Close()
+
+	injected := errors.New("injected ALTER failure")
+	lockName := MigrationLockName("testdb")
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+		WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
+		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
+	expectDirtyGuardRefusal(t, mock)
+	expectFreshBootstrapIdentityMatch(mock)
+	expectCloneLocalFKProbe(mock, true, true)
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	expectCloneLocalFKProbe(mock, true, false)
+	mock.ExpectExec("DELETE FROM `?events`?").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ALTER TABLE `?events`? ADD CONSTRAINT").WillReturnError(injected)
+	// No second MigrateUp: straight to the lock release.
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
+		WithArgs(lockName).
+		WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(1))
+
+	applied, err := MigrateUpWithLock(ctx, conn, "testdb",
+		WithFreshBootstrapHeal(testFreshBootstrapHealCapability(), testBootstrapEndpoint))
+	if applied != 0 {
+		t.Fatalf("MigrateUpWithLock() applied = %d, want 0", applied)
+	}
+	if err == nil {
+		t.Fatal("MigrateUpWithLock() error = nil, want the relink failure")
+	}
+	msg := err.Error()
+	for _, want := range []string{"fresh-bootstrap reset", "hard reset succeeded", "events.fk_events_issue", injected.Error()} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("MigrateUpWithLock() error %q does not contain %q", msg, want)
+		}
+	}
+	if !errors.Is(err, injected) {
+		t.Errorf("MigrateUpWithLock() error does not wrap the injected ALTER failure")
+	}
+	var dirtyErr *DirtyTablesError
+	if errors.As(err, &dirtyErr) {
+		t.Errorf("MigrateUpWithLock() error still carries the stale DirtyTablesError: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet SQL expectations: %v", err)

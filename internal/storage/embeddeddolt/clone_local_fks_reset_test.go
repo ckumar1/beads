@@ -5,7 +5,6 @@ package embeddeddolt_test
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"strings"
 	"testing"
 
@@ -309,20 +308,4 @@ func TestResetHardPreservingCloneLocalFKs_PurgesOrphansTheResetCreated(t *testin
 		t.Fatalf("Relinked = %v, want events.fk_events_issue with at least 1 orphan removed", result.Relinked)
 	}
 	te.assertCloneLocalFKs(t, ctx, "after reset")
-}
-
-func TestCloneLocalFKRelinkErrorSaysResetSucceededAndNamesFK(t *testing.T) {
-	err := error(&schema.CloneLocalFKRelinkError{Failures: []schema.CloneLocalFKRelinkFailure{{
-		FK:  schema.CloneLocalFKs[0],
-		Err: errors.New("boom"),
-	}}})
-	msg := err.Error()
-	for _, want := range []string{"hard reset succeeded", "events.fk_events_issue", "boom", "bd doctor --fix"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("error %q does not contain %q", msg, want)
-		}
-	}
-	if strings.Contains(msg, "\n") {
-		t.Errorf("error %q is multi-line", msg)
-	}
 }

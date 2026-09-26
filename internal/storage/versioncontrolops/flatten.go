@@ -2,10 +2,7 @@ package versioncontrolops
 
 import (
 	"context"
-	"errors"
 	"fmt"
-
-	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
 // Flatten squashes all Dolt commit history into a single commit using
@@ -24,7 +21,7 @@ import (
 //
 // conn must be a single database connection (not a pooled *sql.DB) since the
 // stored procedures rely on session-scoped state (current branch, working set).
-func Flatten(ctx context.Context, conn DBConn) error {
+func Flatten(ctx context.Context, conn DBConn) (retErr error) {
 	// Find the initial commit hash (oldest ancestor).
 	var initialHash string
 	if err := conn.QueryRowContext(ctx,
@@ -43,6 +40,21 @@ func Flatten(ctx context.Context, conn DBConn) error {
 	if commitCount <= 1 {
 		return nil // already flat
 	}
+
+	// Once flatten-tmp exists, every failure deletes it again: a leftover
+	// flatten-tmp blocks every later flatten at "create temp branch". Like
+	// Compact's cleanup this is best-effort, but a failed delete is appended
+	// to the error so the operator knows the branch is still there.
+	branchCreated := false
+	defer func() {
+		if retErr == nil || !branchCreated {
+			return
+		}
+		_, _ = conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')")
+		if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'flatten-tmp')"); err != nil {
+			retErr = fmt.Errorf("%w (cleanup also failed: delete temp branch flatten-tmp: %v)", retErr, err)
+		}
+	}()
 
 	execSQL := func(name, query string, args ...interface{}) error {
 		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
@@ -63,30 +75,27 @@ func Flatten(ctx context.Context, conn DBConn) error {
 		{"checkout main", "CALL DOLT_CHECKOUT('main')", nil},
 	}
 
-	for _, s := range steps {
+	for i, s := range steps {
 		if err := execSQL(s.name, s.query, s.args...); err != nil {
 			return err
+		}
+		if i == 0 {
+			branchCreated = true
 		}
 	}
 
 	// bd-7bpkd / ga-28co77: the hard reset drops every clone-local FK; the
-	// helper re-links the ones it dropped, on this same session. A re-link
-	// failure still means main was reset, so the temp branch is deleted
-	// before the failure is returned — a leftover flatten-tmp would block
-	// every later flatten at "create temp branch".
-	resetErr := resetHardPreservingCloneLocalFKs(ctx, conn, "flatten-tmp")
-	var relinkErr *schema.CloneLocalFKRelinkError
-	if resetErr != nil && !errors.As(resetErr, &relinkErr) {
-		return fmt.Errorf("flatten step %q: %w", "reset main to flattened", resetErr)
-	}
-	if err := execSQL("delete temp branch", "CALL DOLT_BRANCH('-D', 'flatten-tmp')"); err != nil {
-		return errors.Join(err, resetErr)
-	}
-	if resetErr != nil {
-		return fmt.Errorf("flatten step %q: %w", "reset main to flattened", resetErr)
+	// helper re-links the ones it dropped, on this same session. Any failure
+	// here — a probe failure before the reset, or a re-link failure after it
+	// — deletes flatten-tmp through the deferred cleanup above.
+	if err := resetHardPreservingCloneLocalFKs(ctx, conn, "flatten-tmp"); err != nil {
+		return fmt.Errorf("flatten step %q: %w", "reset main to flattened", err)
 	}
 
-	return nil
+	// This step reports its own failure; the deferred cleanup would only
+	// repeat it.
+	branchCreated = false
+	return execSQL("delete temp branch", "CALL DOLT_BRANCH('-D', 'flatten-tmp')")
 }
 
 // FlattenDryRun returns the commit count and initial hash without modifying anything.
