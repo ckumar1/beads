@@ -179,3 +179,55 @@ func TestRelinkCloneLocalFK_QuotesIdentifiers(t *testing.T) {
 		t.Fatalf("unmet SQL expectations: %v", err)
 	}
 }
+
+// Astra r2 SF (clone_local_fks.go:335): when the DELETE removed rows and the
+// ALTER then fails, the completed deletions must be disclosed — in the error
+// and in the returned count — so nobody believes the table was left untouched.
+func TestRelinkCloneLocalFK_ReportsDeletedRowsWhenAlterFails(t *testing.T) {
+	db, mock := newFKMockDB(t)
+	fk := specFK(t, "events.fk_events_issue")
+	del, alter := relinkSQL(fk)
+	mock.ExpectExec(del).WillReturnResult(sqlmock.NewResult(0, 10))
+	mock.ExpectExec(alter).WillReturnError(errInjected)
+
+	removed, err := RelinkCloneLocalFK(context.Background(), db, fk)
+	if err == nil || !errors.Is(err, errInjected) {
+		t.Fatalf("RelinkCloneLocalFK() error = %v, want the injected ALTER failure", err)
+	}
+	if removed != 10 {
+		t.Errorf("RelinkCloneLocalFK() removed = %d, want 10", removed)
+	}
+	if !strings.Contains(err.Error(), "10 orphaned row(s)") {
+		t.Errorf("RelinkCloneLocalFK() error %q does not disclose the 10 rows already deleted", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// The same disclosure reaches the helper's reset-succeeded error.
+func TestResetHardPreservingCloneLocalFKs_ReportsDeletedRowsWhenRelinkFails(t *testing.T) {
+	db, mock := newFKMockDB(t)
+	events := specFK(t, "events.fk_events_issue")
+	tables := map[string]bool{"events": true}
+	expectFKProbe(mock, tables, map[string]bool{events.String(): true})
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	expectFKProbe(mock, tables, nil)
+	del, alter := relinkSQL(events)
+	mock.ExpectExec(del).WillReturnResult(sqlmock.NewResult(0, 10))
+	mock.ExpectExec(alter).WillReturnError(errInjected)
+
+	_, err := ResetHardPreservingCloneLocalFKs(context.Background(), db, "")
+	if err == nil {
+		t.Fatal("err = nil, want the relink failure")
+	}
+	for _, want := range []string{"hard reset succeeded", "events.fk_events_issue", "10 orphaned row(s)", errInjected.Error()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}

@@ -24,13 +24,15 @@ import (
 func Compact(ctx context.Context, conn DBConn, initialHash, boundaryHash string, oldCommits int, recentHashes []string) (retErr error) {
 	branchCreated := false
 
-	// Best-effort cleanup: if any step fails after creating the temp branch,
-	// try to return to main and delete the temp branch so future compactions
-	// aren't blocked by a leftover branch.
+	// Cleanup: if any step fails after creating the temp branch, return to
+	// main and delete the temp branch so future compactions aren't blocked by
+	// a leftover branch. It survives a cancelled ctx, and any cleanup failure
+	// is appended to the error (ga-28co77 review round 3).
 	defer func() {
 		if retErr != nil && branchCreated {
-			_, _ = conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')")
-			_, _ = conn.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'compact-tmp')")
+			if err := cleanupTempBranch(ctx, conn, "compact-tmp"); err != nil {
+				retErr = fmt.Errorf("%w (%v)", retErr, err)
+			}
 		}
 	}()
 

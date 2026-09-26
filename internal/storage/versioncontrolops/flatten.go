@@ -41,18 +41,18 @@ func Flatten(ctx context.Context, conn DBConn) (retErr error) {
 		return nil // already flat
 	}
 
-	// Once flatten-tmp exists, every failure deletes it again: a leftover
-	// flatten-tmp blocks every later flatten at "create temp branch". Like
-	// Compact's cleanup this is best-effort, but a failed delete is appended
-	// to the error so the operator knows the branch is still there.
+	// Once flatten-tmp exists, every failure returns to main and deletes it
+	// again: a leftover flatten-tmp blocks every later flatten at "create temp
+	// branch". The cleanup survives a cancelled ctx, and any cleanup failure
+	// (checkout or delete) is appended to the error so the operator knows the
+	// session or the branch was left behind.
 	branchCreated := false
 	defer func() {
 		if retErr == nil || !branchCreated {
 			return
 		}
-		_, _ = conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')")
-		if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'flatten-tmp')"); err != nil {
-			retErr = fmt.Errorf("%w (cleanup also failed: delete temp branch flatten-tmp: %v)", retErr, err)
+		if err := cleanupTempBranch(ctx, conn, "flatten-tmp"); err != nil {
+			retErr = fmt.Errorf("%w (%v)", retErr, err)
 		}
 	}()
 

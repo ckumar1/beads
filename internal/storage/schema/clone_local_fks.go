@@ -154,7 +154,9 @@ func RelinkCloneLocalFK(ctx context.Context, db DBConn, fk CloneLocalFK) (remove
 		fk.Table, fk.Constraint, fk.Column, fk.RefTable, fk.RefColumn,
 	)
 	if _, err := db.ExecContext(ctx, addConstraint); err != nil {
-		return removed, fmt.Errorf("re-add %s: %w", fk, err)
+		// The DELETE already committed: say how many rows it removed, so a
+		// failed re-link is never mistaken for an untouched table.
+		return removed, fmt.Errorf("re-add %s after deleting %d orphaned row(s): %w", fk, removed, err)
 	}
 	return removed, nil
 }
