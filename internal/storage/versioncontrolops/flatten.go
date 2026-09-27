@@ -3,6 +3,7 @@ package versioncontrolops
 import (
 	"context"
 	"fmt"
+	"os"
 )
 
 // Flatten squashes all Dolt commit history into a single commit using
@@ -55,7 +56,12 @@ func Flatten(ctx context.Context, conn DBConn) (retErr error) {
 		if err := cleanupTempBranch(ctx, conn, "flatten-tmp"); err != nil {
 			retErr = fmt.Errorf("%w (%v)", retErr, err)
 		} else if finalDelete {
-			retErr = fmt.Errorf("%w (the cleanup retry deleted flatten-tmp)", retErr)
+			// Only the final delete had failed, and the retry just deleted
+			// flatten-tmp: the flatten fully succeeded. Report the retried
+			// delete as a warning, the way this package reports other
+			// non-fatal events, and return nil (upstream review, #6772).
+			fmt.Fprintf(os.Stderr, "Warning: %v; the cleanup retry deleted flatten-tmp\n", retErr)
+			retErr = nil
 		}
 	}()
 
@@ -98,8 +104,9 @@ func Flatten(ctx context.Context, conn DBConn) (retErr error) {
 	// The flatten itself has succeeded; only deleting flatten-tmp remains. The
 	// flag stays set until that delete succeeds, so a failed delete (e.g. the
 	// caller was cancelled here) is retried by the deferred cleanup on its own
-	// context instead of stranding the branch (Astra r3). The error says the
-	// flatten succeeded; the cleanup appends its own failure, if any.
+	// context instead of stranding the branch (Astra r3). If the retry deletes
+	// it, Flatten returns nil with a warning; if the retry fails too, the error
+	// says the flatten succeeded and appends the cleanup failure.
 	finalDelete = true
 	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'flatten-tmp')"); err != nil {
 		return fmt.Errorf("flatten succeeded, but deleting temp branch flatten-tmp failed: %w", err)
