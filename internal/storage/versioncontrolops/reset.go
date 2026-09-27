@@ -35,7 +35,7 @@ const tempBranchCleanupTimeout = 30 * time.Second
 // failed flatten or compact (bd-7bpkd, ga-28co77 review round 3).
 //
 // It runs on a context that keeps ctx's values but not its cancellation or
-// deadline, bounded by tempBranchCleanupTimeout. A cancelled caller is the most
+// deadline, bounded by tempBranchCleanupTimeout. A canceled caller is the most
 // likely reason the operation failed; cleaning up on that same context would
 // fail both statements at once, leave the session on the temp branch, and
 // strand the branch so that every later run fails creating it.

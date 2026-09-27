@@ -26,7 +26,7 @@ func Compact(ctx context.Context, conn DBConn, initialHash, boundaryHash string,
 
 	// Cleanup: if any step fails after creating the temp branch, return to
 	// main and delete the temp branch so future compactions aren't blocked by
-	// a leftover branch. It survives a cancelled ctx, and any cleanup failure
+	// a leftover branch. It survives a canceled ctx, and any cleanup failure
 	// is appended to the error (ga-28co77 review round 3).
 	defer func() {
 		if retErr != nil && branchCreated {

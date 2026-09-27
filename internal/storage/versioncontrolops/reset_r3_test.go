@@ -70,7 +70,7 @@ func (r *recordingConn) assertNoUnexpectedCalls(t *testing.T) {
 
 // --- Flatten / Compact cleanup ------------------------------------------------
 
-// BLOCKER (Astra r2, flatten.go:53): the caller's context is cancelled right
+// BLOCKER (Astra r2, flatten.go:53): the caller's context is canceled right
 // after the session checks out flatten-tmp. The next step fails with the
 // cancellation, and the cleanup must STILL check out main and delete the
 // branch — on a context that does not share the caller's cancellation.
@@ -184,7 +184,7 @@ func TestFlattenCreateBranchFailureSkipsCleanup(t *testing.T) {
 }
 
 // Compact has the same cleanup: it too must run after the caller's context is
-// cancelled.
+// canceled.
 func TestCompactCleanupRunsAfterCallerCancellation(t *testing.T) {
 	db, mock := newMock(t)
 	ctx, cancel := context.WithCancel(context.Background())

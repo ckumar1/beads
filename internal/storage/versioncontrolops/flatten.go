@@ -44,7 +44,7 @@ func Flatten(ctx context.Context, conn DBConn) (retErr error) {
 
 	// Once flatten-tmp exists, every failure returns to main and deletes it
 	// again: a leftover flatten-tmp blocks every later flatten at "create temp
-	// branch". The cleanup survives a cancelled ctx, and any cleanup failure
+	// branch". The cleanup survives a canceled ctx, and any cleanup failure
 	// (checkout or delete) is appended to the error so the operator knows the
 	// session or the branch was left behind.
 	branchCreated := false
@@ -103,7 +103,7 @@ func Flatten(ctx context.Context, conn DBConn) (retErr error) {
 
 	// The flatten itself has succeeded; only deleting flatten-tmp remains. The
 	// flag stays set until that delete succeeds, so a failed delete (e.g. the
-	// caller was cancelled here) is retried by the deferred cleanup on its own
+	// caller was canceled here) is retried by the deferred cleanup on its own
 	// context instead of stranding the branch (Astra r3). If the retry deletes
 	// it, Flatten returns nil with a warning; if the retry fails too, the error
 	// says the flatten succeeded and appends the cleanup failure.

@@ -120,7 +120,7 @@ func TestCompactFinalDeleteAfterCancellationGoesThroughCleanup(t *testing.T) {
 
 	err := Compact(ctx, rc, "c0", "c1", 2, []string{"c2"})
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Compact() error = %v, want the cancelled final delete", err)
+		t.Fatalf("Compact() error = %v, want the canceled final delete", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("compact-tmp was not cleaned up after the final delete failed: %v", err)
