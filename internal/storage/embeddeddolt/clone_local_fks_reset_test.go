@@ -17,8 +17,9 @@ import (
 // every clone-local (dolt_ignored) table. These tests pin that every
 // production hard reset re-links what it drops (the ones it reached — flatten
 // and compact — end to end, the shared helper directly), leaves an FK that was
-// already severed alone while naming it, and purges only the orphans the
-// reset itself created before re-adding.
+// already severed alone while naming it, and, before re-adding a dropped FK,
+// purges that FK's orphans (in these tests, the ones the reset itself
+// created).
 
 // withPinnedConn runs fn on a raw SQL session on te's main branch, pinned to
 // one connection so a reset and the statements after it share a session. The

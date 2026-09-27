@@ -167,8 +167,9 @@ func RelinkCloneLocalFK(ctx context.Context, db DBConn, fk CloneLocalFK) (remove
 var ErrHardResetNotRun = errors.New("hard reset not run")
 
 // RelinkedCloneLocalFK is a constraint a hard reset dropped and
-// ResetHardPreservingCloneLocalFKs re-added, with the number of rows the
-// reset had orphaned and the helper deleted first.
+// ResetHardPreservingCloneLocalFKs re-added, with the number of that FK's
+// orphan rows the helper deleted first: normally the rows the reset itself
+// orphaned, plus any older orphans the FK had (see the helper's doc).
 type RelinkedCloneLocalFK struct {
 	CloneLocalFK
 	OrphansRemoved int64

@@ -40,14 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bd flatten`, `bd compact`, merge-abort recovery and fresh-bootstrap heal
   turned enforcement off for good and let orphan rows pile up. Every one of
   those resets now goes through one helper that re-links, on the same
-  session, each clone-local FK the reset dropped, after deleting only the rows
-  that reset itself orphaned. A foreign key that was already missing before
-  the reset is left alone (its orphans can number in the hundreds of
-  thousands) and is named in a warning that points at `bd doctor --fix`. If a
-  re-link fails, the command errors, says the reset succeeded, and names the
-  constraint (if the FKs cannot even be re-read after the reset, it says their
-  state is unknown instead). The FK spec and relink code moved from the doctor
-  to `internal/storage/schema`; `bd doctor` behaves as before.
+  session, each clone-local FK the reset dropped, after deleting the orphan
+  rows of those previously present FKs: mostly rows the reset itself
+  orphaned, though older orphans of the same FKs go too (see below). A
+  foreign key that was already missing before the reset is left alone (its
+  orphans can number in the hundreds of thousands) and is named in a warning
+  that points at `bd doctor --fix`. If a re-link fails, the command errors,
+  says the reset succeeded, and names the constraint (if the FKs cannot even
+  be re-read after the reset, it says their state is unknown instead). The FK
+  spec and relink code moved from the doctor to `internal/storage/schema`;
+  `bd doctor` behaves as before.
 
   Three things to know. The DELETE removes *every* orphan of an FK the reset
   dropped; that is exactly "the rows the reset orphaned" only when the FK was

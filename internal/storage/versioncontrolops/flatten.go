@@ -47,12 +47,15 @@ func Flatten(ctx context.Context, conn DBConn) (retErr error) {
 	// (checkout or delete) is appended to the error so the operator knows the
 	// session or the branch was left behind.
 	branchCreated := false
+	finalDelete := false
 	defer func() {
 		if retErr == nil || !branchCreated {
 			return
 		}
 		if err := cleanupTempBranch(ctx, conn, "flatten-tmp"); err != nil {
 			retErr = fmt.Errorf("%w (%v)", retErr, err)
+		} else if finalDelete {
+			retErr = fmt.Errorf("%w (the cleanup retry deleted flatten-tmp)", retErr)
 		}
 	}()
 
@@ -92,10 +95,17 @@ func Flatten(ctx context.Context, conn DBConn) (retErr error) {
 		return fmt.Errorf("flatten step %q: %w", "reset main to flattened", err)
 	}
 
-	// This step reports its own failure; the deferred cleanup would only
-	// repeat it.
+	// The flatten itself has succeeded; only deleting flatten-tmp remains. The
+	// flag stays set until that delete succeeds, so a failed delete (e.g. the
+	// caller was cancelled here) is retried by the deferred cleanup on its own
+	// context instead of stranding the branch (Astra r3). The error says the
+	// flatten succeeded; the cleanup appends its own failure, if any.
+	finalDelete = true
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'flatten-tmp')"); err != nil {
+		return fmt.Errorf("flatten succeeded, but deleting temp branch flatten-tmp failed: %w", err)
+	}
 	branchCreated = false
-	return execSQL("delete temp branch", "CALL DOLT_BRANCH('-D', 'flatten-tmp')")
+	return nil
 }
 
 // FlattenDryRun returns the commit count and initial hash without modifying anything.
