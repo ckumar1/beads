@@ -196,8 +196,11 @@ type ResetHardResult struct {
 	// RemovedWithTable are FKs present before the reset whose own table, or
 	// the table they reference, the reset removed (for example a
 	// fresh-bootstrap heal discarding an uncommitted table): the FK went with
-	// its table. There is nothing to re-link, no orphan to purge, and nothing
-	// for `bd doctor --fix` to do. Not a failure, and not in Warning().
+	// its table, so there is nothing to re-link. When the FK's own table is
+	// gone, its rows went too. When only the referenced table is gone, the
+	// surviving table's rows may now point at nothing; they are left as they
+	// are, never purged here, for the same reason AlreadySevered rows are not.
+	// Not a failure, and not in Warning().
 	RemovedWithTable []CloneLocalFK
 	// AlreadySevered are the FKs that were already missing before the reset.
 	// They are left exactly as found — no orphan purge, no re-add — because a
