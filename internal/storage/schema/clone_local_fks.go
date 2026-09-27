@@ -63,25 +63,25 @@ type SeveredCloneLocalFK struct {
 
 // cloneLocalFKState is which spec FKs are present on the live schema, and
 // which are missing from a table that does exist (severed). An FK whose table
-// does not exist is neither: there is nothing to enforce or re-link.
+// does not exist is neither: there is nothing to enforce or re-link. tables
+// records which spec tables exist.
 type cloneLocalFKState struct {
 	present map[CloneLocalFK]bool
 	severed []CloneLocalFK
+	tables  map[string]bool
 }
 
 // readCloneLocalFKState reads the live clone-local FK state from
 // information_schema on db's current session and database.
 func readCloneLocalFKState(ctx context.Context, db DBConn) (cloneLocalFKState, error) {
-	state := cloneLocalFKState{present: map[CloneLocalFK]bool{}}
+	state := cloneLocalFKState{present: map[CloneLocalFK]bool{}, tables: map[string]bool{}}
 	for _, fk := range CloneLocalFKs {
-		var tables int
-		if err := db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
-			fk.Table,
-		).Scan(&tables); err != nil {
-			return cloneLocalFKState{}, fmt.Errorf("check %s exists: %w", fk.Table, err)
+		exists, err := tableExists(ctx, db, fk.Table)
+		if err != nil {
+			return cloneLocalFKState{}, err
 		}
-		if tables == 0 {
+		state.tables[fk.Table] = exists
+		if !exists {
 			continue
 		}
 
@@ -100,6 +100,18 @@ func readCloneLocalFKState(ctx context.Context, db DBConn) (cloneLocalFKState, e
 		}
 	}
 	return state, nil
+}
+
+// tableExists reports whether table exists in db's current database.
+func tableExists(ctx context.Context, db DBConn, table string) (bool, error) {
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+		table,
+	).Scan(&n); err != nil {
+		return false, fmt.Errorf("check %s exists: %w", table, err)
+	}
+	return n > 0, nil
 }
 
 // ScanSeveredCloneLocalFKs reports which clone-local FKs are missing from the
@@ -181,6 +193,12 @@ type ResetHardResult struct {
 	// Relinked are the FKs present before the reset that the reset dropped
 	// and the helper re-added.
 	Relinked []RelinkedCloneLocalFK
+	// RemovedWithTable are FKs present before the reset whose own table, or
+	// the table they reference, the reset removed (for example a
+	// fresh-bootstrap heal discarding an uncommitted table): the FK went with
+	// its table. There is nothing to re-link, no orphan to purge, and nothing
+	// for `bd doctor --fix` to do. Not a failure, and not in Warning().
+	RemovedWithTable []CloneLocalFK
 	// AlreadySevered are the FKs that were already missing before the reset.
 	// They are left exactly as found — no orphan purge, no re-add — because a
 	// store severed for months can hold hundreds of thousands of orphans and a
@@ -261,7 +279,10 @@ func (e *CloneLocalFKRelinkError) Unwrap() []error {
 //  1. read which clone-local FKs are present before the reset;
 //  2. run the reset;
 //  3. for each FK present before and missing after, delete THAT FK's orphans
-//     and re-add the constraint exactly as `bd doctor --fix` does.
+//     and re-add the constraint exactly as `bd doctor --fix` does — unless the
+//     reset removed the FK's own table or the table it references, in which
+//     case the FK went with its table: it is listed in
+//     Result.RemovedWithTable and not touched (upstream review, #6772).
 //
 // The DELETE removes every orphan of an FK the reset dropped. That equals
 // "the rows the reset orphaned" (e.g. events rows whose issue the reset
@@ -328,9 +349,29 @@ func ResetHardPreservingCloneLocalFKs(ctx context.Context, conn DBConn, target s
 	}
 
 	var failures []CloneLocalFKRelinkFailure
+	refExists := map[string]bool{}
 
 	for _, fk := range CloneLocalFKs {
 		if !before.present[fk] || after.present[fk] {
+			continue
+		}
+		// The FK is gone. If the reset removed its table, or the table it
+		// references, the FK went with that table: nothing to re-link.
+		if !after.tables[fk.Table] {
+			result.RemovedWithTable = append(result.RemovedWithTable, fk)
+			continue
+		}
+		exists, seen := refExists[fk.RefTable]
+		if !seen {
+			var err error
+			if exists, err = tableExists(ctx, conn, fk.RefTable); err != nil {
+				failures = append(failures, CloneLocalFKRelinkFailure{FK: fk, Err: err})
+				continue
+			}
+			refExists[fk.RefTable] = exists
+		}
+		if !exists {
+			result.RemovedWithTable = append(result.RemovedWithTable, fk)
 			continue
 		}
 		removed, err := RelinkCloneLocalFK(ctx, conn, fk)

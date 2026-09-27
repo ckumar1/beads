@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -99,9 +100,11 @@ func TestResetHardPreservingCloneLocalFKs_ContinuesPastAFailedRelink(t *testing.
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	expectFKProbe(mock, tables, nil)
+	expectRefTableExists(mock, "issues", true)
 	del, alter := relinkSQL(events)
 	mock.ExpectExec(del).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(alter).WillReturnError(errInjected)
+	expectRefTableExists(mock, "wisps", true)
 	del, alter = relinkSQL(labels)
 	mock.ExpectExec(del).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(alter).WillReturnResult(sqlmock.NewResult(0, 0))
@@ -214,6 +217,7 @@ func TestResetHardPreservingCloneLocalFKs_ReportsDeletedRowsWhenRelinkFails(t *t
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	expectFKProbe(mock, tables, nil)
+	expectRefTableExists(mock, "issues", true)
 	del, alter := relinkSQL(events)
 	mock.ExpectExec(del).WillReturnResult(sqlmock.NewResult(0, 10))
 	mock.ExpectExec(alter).WillReturnError(errInjected)
@@ -226,6 +230,51 @@ func TestResetHardPreservingCloneLocalFKs_ReportsDeletedRowsWhenRelinkFails(t *t
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err, want)
 		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// expectRefTableExists mocks the helper's check, made only for an FK the
+// reset dropped from a table that survived, that the FK's referenced table
+// survived too.
+func expectRefTableExists(mock sqlmock.Sqlmock, table string, exists bool) {
+	n := 0
+	if exists {
+		n = 1
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?")).
+		WithArgs(table).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
+}
+
+// Upstream review 1, MAJOR 1 (helper level): the reset keeps the FK's own
+// table but removes the table it REFERENCES. The FK went with that table:
+// there is nothing to re-link, so no DELETE, no ALTER, no error, and the
+// result reports it as removed with its table.
+func TestResetHardPreservingCloneLocalFKs_RefTableRemovedByReset(t *testing.T) {
+	db, mock := newFKMockDB(t)
+	tables := map[string]bool{"events": true}
+	expectFKProbe(mock, tables, map[string]bool{"events.fk_events_issue": true})
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	expectFKProbe(mock, tables, nil) // events survives, its FK does not
+	expectRefTableExists(mock, "issues", false)
+
+	result, err := ResetHardPreservingCloneLocalFKs(context.Background(), db, "")
+	if err != nil {
+		t.Fatalf("ResetHardPreservingCloneLocalFKs() error = %v, want nil (the FK went with its referenced table)", err)
+	}
+	if len(result.Relinked) != 0 || len(result.AlreadySevered) != 0 {
+		t.Errorf("result = %+v, want nothing relinked and nothing already severed", result)
+	}
+	// Checked through %+v so this test also compiles on the pre-fix head.
+	if got := fmt.Sprintf("%+v", result); !strings.Contains(got, "RemovedWithTable:[events.fk_events_issue]") {
+		t.Errorf("result = %s, want RemovedWithTable:[events.fk_events_issue]", got)
+	}
+	if w := result.Warning(); w != "" {
+		t.Errorf("Warning() = %q, want none: there is nothing for bd doctor --fix to do", w)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet SQL expectations: %v", err)

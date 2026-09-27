@@ -23,6 +23,7 @@ func expectSuccessfulResetAndRelink(mock sqlmock.Sqlmock, target string) {
 		WithArgs(target).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	expectEventsProbe(mock, false)
+	expectIssuesTableExists(mock)
 	mock.ExpectExec("DELETE FROM `?events`?").WillReturnResult(sqlmock.NewResult(0, 0))
 	expectExecOK(mock, "ALTER TABLE `events` ADD CONSTRAINT `fk_events_issue` FOREIGN KEY (`issue_id`) REFERENCES `issues` (`id`) ON DELETE CASCADE ON UPDATE CASCADE")
 }
@@ -37,31 +38,31 @@ func cancelAfterRelink(cancel context.CancelFunc) func(string) {
 	}
 }
 
-// The caller is cancelled after the flatten succeeded: the final delete fails
-// on the cancelled context, and the deferred cleanup must still check out
-// main and delete flatten-tmp on its own context. The error must say the
-// flatten itself succeeded.
-func TestFlattenFinalDeleteAfterCancellationGoesThroughCleanup(t *testing.T) {
+// The caller is canceled after the flatten succeeded: the final delete fails
+// on the canceled context, and the deferred cleanup must still check out main
+// and delete flatten-tmp on its own context. Once that retry has deleted the
+// branch the flatten has fully succeeded, so Flatten returns nil (upstream
+// review 1, MINOR 3) and reports the retried delete as a stderr warning, the
+// way this package reports other non-fatal events.
+func TestFlattenFinalDeleteRetriedByCleanupReturnsNilWithWarning(t *testing.T) {
 	db, mock := newMock(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rc := &recordingConn{inner: db, afterExec: cancelAfterRelink(cancel)}
 	expectFlattenUpToReset(mock)
 	expectSuccessfulResetAndRelink(mock, "flatten-tmp")
-	// The final delete never reaches the server (ctx is cancelled); the
+	// The final delete never reaches the server (ctx is canceled); the
 	// deferred cleanup does.
 	expectExecOK(mock, "CALL DOLT_CHECKOUT('main')")
 	expectExecOK(mock, "CALL DOLT_BRANCH('-D', 'flatten-tmp')")
 
-	err := Flatten(ctx, rc)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Flatten() error = %v, want the cancelled final delete", err)
+	var err error
+	stderr := captureStderr(t, func() { err = Flatten(ctx, rc) })
+	if err != nil {
+		t.Fatalf("Flatten() error = %v, want nil: the flatten succeeded and the cleanup retry deleted flatten-tmp", err)
 	}
-	assertContainsAll(t, "Flatten() error", err.Error(),
-		"flatten succeeded", "deleting temp branch flatten-tmp failed", "the cleanup retry deleted flatten-tmp")
-	if strings.Contains(err.Error(), "cleanup also failed") {
-		t.Errorf("Flatten() error %q reports a cleanup failure, want the cleanup retry to succeed", err)
-	}
+	assertContainsAll(t, "Flatten stderr", stderr,
+		"Warning:", "flatten succeeded", "flatten-tmp", "context canceled", "cleanup retry deleted")
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("flatten-tmp was not cleaned up after the final delete failed: %v", err)
 	}

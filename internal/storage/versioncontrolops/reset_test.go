@@ -45,6 +45,14 @@ func expectEventsProbe(mock sqlmock.Sqlmock, fkPresent bool) {
 	}
 }
 
+// expectIssuesTableExists mocks the helper's check that fk_events_issue's
+// referenced table survived the reset (made before re-linking it).
+func expectIssuesTableExists(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(regexp.QuoteMeta("FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?")).
+		WithArgs("issues").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+}
+
 // expectProbeFails mocks a pre-reset probe whose first query fails.
 func expectProbeFails(mock sqlmock.Sqlmock) {
 	mock.ExpectQuery(regexp.QuoteMeta("FROM information_schema.TABLES")).
@@ -66,6 +74,7 @@ func expectResetThenFailedRelink(mock sqlmock.Sqlmock, target string) {
 			WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	}
 	expectEventsProbe(mock, false)
+	expectIssuesTableExists(mock)
 	mock.ExpectExec("DELETE FROM `?events`?").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE `?events`? ADD CONSTRAINT `?fk_events_issue`?").WillReturnError(errInjected)
 }

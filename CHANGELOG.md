@@ -47,9 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orphans can number in the hundreds of thousands) and is named in a warning
   that points at `bd doctor --fix`. If a re-link fails, the command errors,
   says the reset succeeded, and names the constraint (if the FKs cannot even
-  be re-read after the reset, it says their state is unknown instead). The FK
-  spec and relink code moved from the doctor to `internal/storage/schema`;
-  `bd doctor` behaves as before.
+  be re-read after the reset, it says their state is unknown instead). An FK
+  whose own table, or referenced table, the reset itself removed (as when the
+  fresh-bootstrap heal discards an uncommitted table) went with that table:
+  it is reported as removed with its table, not as a failure, and the heal
+  re-runs its migrations as before. The FK spec and relink code moved from
+  the doctor to `internal/storage/schema`; `bd doctor` behaves as before.
 
   Three things to know. The DELETE removes *every* orphan of an FK the reset
   dropped; that is exactly "the rows the reset orphaned" only when the FK was

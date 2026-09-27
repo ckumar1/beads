@@ -770,10 +770,62 @@ func TestMigrateUpWithLockFreshBootstrapHealRelinksCloneLocalFKs(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	expectCloneLocalFKProbe(mock, true, false)
+	expectRefTableExists(mock, "issues", true)
 	mock.ExpectExec("DELETE FROM `?events`? WHERE `?issue_id`? IS NOT NULL AND NOT EXISTS \\(SELECT 1 FROM `?issues`? r WHERE r\\.`?id`? = `?events`?\\.`?issue_id`?\\)").
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec("ALTER TABLE `?events`? ADD CONSTRAINT `?fk_events_issue`? FOREIGN KEY \\(`?issue_id`?\\) REFERENCES `?issues`? \\(`?id`?\\) ON DELETE CASCADE ON UPDATE CASCADE").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	expectOnePendingMigration(t, mock)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
+		WithArgs(lockName).
+		WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(1))
+
+	applied, err := MigrateUpWithLock(ctx, conn, "testdb",
+		WithFreshBootstrapHeal(testFreshBootstrapHealCapability(), testBootstrapEndpoint))
+	if err != nil {
+		t.Fatalf("MigrateUpWithLock() error = %v", err)
+	}
+	if applied != 1 {
+		t.Fatalf("MigrateUpWithLock() applied = %d, want 1", applied)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// TestMigrateUpWithLockFreshBootstrapHealTableRemovedByReset is the
+// maintainer's probe from gastownhall/beads#6772 review 1 (MAJOR 1). A fresh
+// bootstrap killed between 0005_create_events.up.sql and its
+// commitMigrationStep leaves events (tracked until 0062) and fk_events_issue
+// uncommitted in the working set. The heal's hard reset discards the whole
+// table, so afterwards there is nothing to re-link: the FK went with its
+// table. The heal must not report that as a relink failure; it must re-run
+// the migration pass, exactly as it did before the relink existed.
+func TestMigrateUpWithLockFreshBootstrapHealTableRemovedByReset(t *testing.T) {
+	failOnSwallowedAdvisory(t)
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin mock connection: %v", err)
+	}
+	defer conn.Close()
+
+	lockName := MigrationLockName("testdb")
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+		WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
+		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
+	expectDirtyGuardRefusal(t, mock)
+	expectFreshBootstrapIdentityMatch(mock)
+	expectCloneLocalFKProbe(mock, true, true) // events + FK in the working set
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	expectCloneLocalFKProbe(mock, false, false) // the reset discarded the uncommitted table
 	expectOnePendingMigration(t, mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
 		WithArgs(lockName).
@@ -823,6 +875,7 @@ func TestMigrateUpWithLockFreshBootstrapHealRelinkFailureStopsAndReleasesLock(t 
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	expectCloneLocalFKProbe(mock, true, false)
+	expectRefTableExists(mock, "issues", true)
 	mock.ExpectExec("DELETE FROM `?events`?").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE `?events`? ADD CONSTRAINT").WillReturnError(injected)
 	// No second MigrateUp: straight to the lock release.
