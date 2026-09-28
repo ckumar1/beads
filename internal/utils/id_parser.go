@@ -49,7 +49,7 @@ func parseIssueID(input string, prefix string) string {
 // - Hierarchical: "a3f8e9.1" → "bd-a3f8e9.1"
 //
 // Returns an error if:
-// - The input is a bare tooling sentinel ("", "null", "undefined")
+// - The input is a bare tooling sentinel ("", "null", "undefined", "none", "nil")
 // - No issue found matching the ID
 // - Multiple issues match (ambiguous prefix)
 func ResolvePartialID(ctx context.Context, store PartialIDResolverStore, input string) (string, error) {
@@ -58,8 +58,8 @@ func ResolvePartialID(ctx context.Context, store PartialIDResolverStore, input s
 	switch strings.ToLower(strings.TrimSpace(input)) {
 	case "":
 		return "", fmt.Errorf("refusing an empty string as an issue ID")
-	case "null", "undefined":
-		return "", fmt.Errorf("refusing %q as an issue ID: that is what jq and JS tooling print for a missing value, so the caller's selector matched nothing", input)
+	case "null", "undefined", "none", "nil":
+		return "", fmt.Errorf("refusing %q as an issue ID: that is what tooling prints for a missing value (jq/JS null and undefined, Python None, Go/Ruby nil), so the caller's selector matched nothing", input)
 	}
 
 	if store == nil {

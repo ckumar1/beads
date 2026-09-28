@@ -14,6 +14,8 @@ func TestResolvePartialIDRefusesSentinelTokens(t *testing.T) {
 	refused := []string{
 		"null", "NULL", "Null", " null ",
 		"undefined", "UNDEFINED",
+		"none", "NONE", "None", " none ",
+		"nil", "NIL", "Nil",
 		"", "   ",
 	}
 	for _, input := range refused {
