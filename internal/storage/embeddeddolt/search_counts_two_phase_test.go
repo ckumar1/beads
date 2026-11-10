@@ -39,10 +39,6 @@ func TestSearchCountsTwoPhaseMatchesPredicateForm(t *testing.T) {
 	for _, id := range []string{"tp-0", "tp-0", "tp-2"} {
 		must(t, te.store.AddComment(ctx, id, "tester", "note"))
 	}
-	raw, cleanup, err := embeddeddolt.OpenSQL(ctx, te.dataDir, te.database, "main")
-	must(t, err)
-	defer func() { _ = cleanup() }()
-
 	open := []types.Status{types.StatusOpen}
 	for _, tc := range []struct {
 		name, query string
@@ -73,9 +69,25 @@ func TestSearchCountsTwoPhaseMatchesPredicateForm(t *testing.T) {
 			orderBy := sqlbuild.OrderBy(f.SortBy, f.SortDesc, "i")
 			hyd := sqlbuild.CountsHydration{SkipLabels: f.SkipLabels, SkipCounts: f.SkipCounts, Lite: f.Lite}
 
+			// The embedded engine holds an exclusive lock while a raw handle is
+			// open, so the raw reads run on a handle closed before the store seam.
+			raw, cleanup, err := embeddeddolt.OpenSQL(ctx, te.dataDir, te.database, "main")
+			must(t, err)
+			rawClosed := false
+			closeRaw := func() {
+				if !rawClosed {
+					rawClosed = true
+					if err := cleanup(); err != nil {
+						t.Errorf("closing the raw handle: %v", err)
+					}
+				}
+			}
+			defer closeRaw()
+
 			predicateSQL, _ := sqlbuild.SearchCountsSQL(sqlbuild.IssuesFilterTables, nil, whereSQL, orderBy, limitSQL, true, hyd)
 			rows, err := raw.QueryContext(ctx, predicateSQL, args...)
 			must(t, err)
+			defer rows.Close()
 			var want []*types.IssueWithCounts
 			for rows.Next() {
 				iwc, err := issueops.ScanReadyWorkRowWithCounts(rows, hyd)
@@ -88,9 +100,12 @@ func TestSearchCountsTwoPhaseMatchesPredicateForm(t *testing.T) {
 			if tc.name != "matches nothing" && len(want) == 0 {
 				t.Fatal("fixture must give the predicate form rows to compare")
 			}
-			viaStore, err := te.store.SearchIssuesWithCounts(ctx, tc.query, f)
-			must(t, err)
 			viaRepo, err := db.NewIssueSQLRepository(raw).SearchAcrossIssuesAndWispsWithCounts(ctx, tc.query, f)
+			must(t, err)
+			var total int
+			must(t, raw.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues i "+whereSQL, args...).Scan(&total))
+			closeRaw()
+			viaStore, err := te.store.SearchIssuesWithCounts(ctx, tc.query, f)
 			must(t, err)
 			for _, rs := range [][]*types.IssueWithCounts{want, got, viaStore, viaRepo.Items} {
 				for _, iwc := range rs { // deps_json element order is not part of the contract
@@ -107,8 +122,6 @@ func TestSearchCountsTwoPhaseMatchesPredicateForm(t *testing.T) {
 
 			// Both public seams: full rows (IsLitePartial and the hydrated columns
 			// included) and, on the repo seam, HasMore for a limited page.
-			var total int
-			must(t, raw.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues i "+whereSQL, args...).Scan(&total))
 			if f.Limit > 0 && len(want) > f.Limit {
 				want = want[:f.Limit]
 			}
