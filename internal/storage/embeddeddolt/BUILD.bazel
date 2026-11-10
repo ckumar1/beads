@@ -119,6 +119,7 @@ go_test(
         "blocked_recheck_internal_test.go",
         "blocked_recheck_regression_internal_test.go",
         "blocked_recompute_test.go",
+        "blocked_unmark_benchmark_test.go",
         "blocking_annotator_batch_test.go",
         "blocking_annotator_contract_test.go",
         "bootstrapper_contract_test.go",
