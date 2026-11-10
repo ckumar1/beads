@@ -446,10 +446,13 @@ func TestLargeBatchApplyWallClock_Embedded(t *testing.T) {
 // id tombstone tables — in ONE statement where it used to read the two row
 // tables in two: -1 statement per create item (356: 102 creates, -102; 712:
 // 204, -204; classic: 10, -10).
+//
+// Re-pinned for the batched unmark's should-be-blocked read (classic was
+// 805): +7 = one read per batched unmark pass (readShouldBeBlockedInTx).
 var pinnedEmbeddedStatementCounts = map[string]int64{
 	"356 (mol 1x)":    6090,
 	large712ShapeName: 12178,
-	"40 (classic)":    805,
+	"40 (classic)":    812,
 }
 
 // BenchmarkLargeBatchApply_Embedded benchmarks issueops.ApplyBatchInTx on

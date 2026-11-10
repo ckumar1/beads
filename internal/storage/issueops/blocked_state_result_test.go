@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -186,6 +188,86 @@ func TestRunMarkUnmarkBatchedInTxReadsBeforeTheUnmark(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRunMarkUnmarkBatchedInTxReadBindsScopeAndExogeneity pins the unmark
+// read's whole statement and argument list over two chunks, each with its own
+// non-empty exogeneity set: every leg confined to that chunk's ids, and the
+// chunk's explained parents excluded from the two parent-child legs. Dropping
+// the batch scope or the exclusions from the read fails the anchored SQL; the
+// arguments are spelled out by hand, in the text order the legs consume them.
+func TestRunMarkUnmarkBatchedInTxReadBindsScopeAndExogeneity(t *testing.T) {
+	ids := make([]string, queryBatchSize+1)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("issue-%03d", i)
+	}
+	chunks := []struct {
+		ids          []string
+		explained    subtreeExplainedParents
+		stillBlocked string
+	}{
+		{ids[:queryBatchSize], subtreeExplainedParents{issueParents: []string{"parent-1"}, wispParents: []string{"wisp-parent-1"}}, "issue-007"},
+		{ids[queryBatchSize:], subtreeExplainedParents{issueParents: []string{"parent-2"}}, "issue-200"},
+	}
+
+	mock, db := newBlockedStateResultMock(t)
+	for _, c := range chunks {
+		hasWisp, wispParents := len(c.explained.wispParents) > 0, 0
+		if hasWisp {
+			wispParents = 1
+		}
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(d.depends_on_issue_id), COUNT(d.depends_on_wisp_id)")).
+			WillReturnRows(sqlmock.NewRows([]string{"i", "w"}).AddRow(1, wispParents))
+		mock.ExpectQuery(`^WITH`).WillReturnRows(sqlmock.NewRows([]string{"pid"}).AddRow(c.explained.issueParents[0]))
+		climbs := []string{"dependencies", "dependencies"}
+		if hasWisp {
+			mock.ExpectQuery(`^WITH`).WillReturnRows(sqlmock.NewRows([]string{"pid"}).AddRow(c.explained.wispParents[0]))
+			climbs = append(climbs, "wisp_dependencies", "wisp_dependencies")
+		}
+		// The ancestry prune climbs from each explained parent and finds
+		// nothing blocked above it, so the set survives whole.
+		for _, depTable := range climbs {
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT /*+ JOIN_ORDER(d, p) LOOKUP_JOIN(d, p) */ d.issue_id, p.id FROM " + depTable)).
+				WillReturnRows(sqlmock.NewRows([]string{"issue_id", "id"}))
+		}
+		mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 1")).WillReturnResult(sqlmock.NewResult(0, 0))
+
+		placeholders, batch := buildSQLInClause(c.ids)
+		read, _, err := expandBatchTemplate(
+			shouldBeBlockedIDsUnionScopedPrecomputedSQL("dependencies", batchScopeSQL, c.explained),
+			placeholders, batch, c.explained.args())
+		if err != nil {
+			t.Fatalf("expandBatchTemplate: %v", err)
+		}
+		var readArgs []driver.Value
+		for leg := 1; leg <= 5; leg++ {
+			for _, id := range c.ids {
+				readArgs = append(readArgs, id)
+			}
+			if leg == 3 {
+				readArgs = append(readArgs, c.explained.issueParents[0])
+			}
+			if leg == 4 && hasWisp {
+				readArgs = append(readArgs, c.explained.wispParents[0])
+			}
+		}
+		mock.ExpectQuery("^" + regexp.QuoteMeta(stripWhitespace(read)) + "$").WithArgs(readArgs...).
+			WillReturnRows(sqlmock.NewRows([]string{"issue_id"}).AddRow(c.stillBlocked))
+
+		unmarkArgs := append(append([]driver.Value{}, readArgs[:len(c.ids)]...), c.stillBlocked)
+		mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 0")).WithArgs(unmarkArgs...).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+	}
+
+	if _, err := runMarkUnmarkBatchedInTx(context.Background(), db, issuesBlockedSpec, ids); err != nil {
+		t.Fatalf("runMarkUnmarkBatchedInTx: %v", err)
+	}
+}
+
+// stripWhitespace collapses runs of whitespace the way sqlmock does before it
+// matches, so a whole statement can be anchored.
+func stripWhitespace(q string) string {
+	return regexp.MustCompile(`\s+`).ReplaceAllString(strings.TrimSpace(q), " ")
 }
 
 // TestRecomputeIsBlockedSkipsUnionForIDsWithoutEdges pins the no-edge
