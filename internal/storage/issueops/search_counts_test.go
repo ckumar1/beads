@@ -2,10 +2,13 @@ package issueops
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -142,3 +145,119 @@ func TestFinishSearchIssuesWithCountsTruncatesByRequestedSort(t *testing.T) {
 		t.Fatalf("default sort limit=2 kept %v, want [bd-old-p0 bd-mid-p2]", ids)
 	}
 }
+
+// liteCountsRows builds a Lite counts result (ScanReadyWorkRowWithCounts with
+// CountsHydration{Lite: true}) holding one row per id, in the order given.
+func liteCountsRows(ids ...string) *sqlmock.Rows {
+	rows := sqlmock.NewRows(append(liteColumnNames(), "labels_json", "dep_count", "rdep_count", "comment_count", "parent_id", "deps_json"))
+	for _, id := range ids {
+		rows.AddRow(append(liteMergeRow(id, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)), nil, 0, 0, 0, nil, nil)...)
+	}
+	return rows
+}
+
+func iwcIDs(items []*types.IssueWithCounts) []string {
+	out := make([]string, 0, len(items))
+	for _, iwc := range items {
+		out = append(out, iwc.Issue.ID)
+	}
+	return out
+}
+
+// A filtered counts search selects its page ids from the main table alone and
+// hydrates them through the by-IDs form, whose every aggregate is bounded by
+// issue_id IN (...). The result keeps the id query's order, not the order the
+// hydration statement emits, and an id the hydration no longer finds is skipped.
+func TestSearchCountsTwoPhaseHydratesByIDsInIDQueryOrder(t *testing.T) {
+	t.Parallel()
+
+	var captured []string
+	mock, tx := beginCapturingMockTx(t, &captured)
+	mock.ExpectQuery(`^SELECT i\.id FROM issues i WHERE status = \? ORDER BY i\.priority ASC, i\.created_at DESC, i\.id ASC LIMIT 4$`).
+		WithArgs("open").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("bd-c").AddRow("bd-a").AddRow("bd-gone").AddRow("bd-b"))
+	mock.ExpectQuery(`issue_id IN \(`).
+		WillReturnRows(liteCountsRows("bd-a", "bd-b", "bd-c"))
+
+	got, err := SearchCountsTwoPhaseInTx(context.Background(), tx, IssuesFilterTables, "WHERE status = ?",
+		"ORDER BY i.priority ASC, i.created_at DESC, i.id ASC", "LIMIT 4", []any{"open"}, true, liteHydration)
+	if err != nil {
+		t.Fatalf("SearchCountsTwoPhaseInTx: %v", err)
+	}
+	if ids := iwcIDs(got); strings.Join(ids, ",") != "bd-c,bd-a,bd-b" {
+		t.Fatalf("rows = %v, want the id query's order [bd-c bd-a bd-b]", ids)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+	if len(captured) != 2 || strings.Contains(captured[0], "JOIN") {
+		t.Fatalf("want a main-table-only id query and one hydration chunk, got:\n%s", strings.Join(captured, "\n---\n"))
+	}
+	// labels, dc, cc, pc and d each bound by issue_id; rc by its target; the driver by i.id.
+	hydrate := captured[1]
+	if strings.Count(hydrate, "issue_id IN (") != 5 || !strings.Contains(hydrate, "depends_on_external) IN (") ||
+		!strings.Contains(hydrate, "WHERE i.id IN (") || strings.Contains(hydrate, "SELECT i.*") {
+		t.Errorf("hydration is not the by-IDs form:\n%s", hydrate)
+	}
+}
+
+// An id query that matches nothing ends the search: no hydration statement is
+// sent. sqlmock refuses any statement it was not primed for.
+func TestSearchCountsTwoPhaseEmptyPageSendsNoHydration(t *testing.T) {
+	t.Parallel()
+
+	_, mock, tx := beginMockTx(t)
+	mock.ExpectQuery(`^SELECT i\.id FROM wisps i WHERE status = \?`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	got, err := SearchCountsTwoPhaseInTx(context.Background(), tx, WispsFilterTables, "WHERE status = ?", "", "", []any{"open"}, true, liteHydration)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("got %d rows, err %v; want none", len(got), err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// Unfiltered and unbounded, the search keeps the single predicate-form
+// statement, since it reads every row anyway. sqlmock refuses an id query here.
+func TestSearchCountsTwoPhaseUnfilteredUnboundedKeepsOneStatement(t *testing.T) {
+	t.Parallel()
+
+	_, mock, tx := beginMockTx(t)
+	mock.ExpectQuery(`(?s)^\s*SELECT i\..*FROM issues i\s.*LEFT JOIN`).WillReturnRows(liteCountsRows("bd-a"))
+
+	if _, err := SearchCountsTwoPhaseInTx(context.Background(), tx, IssuesFilterTables, "", "ORDER BY i.id ASC", "", nil, true, liteHydration); err != nil {
+		t.Fatalf("SearchCountsTwoPhaseInTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+// A page larger than sqlbuild.QueryBatchSize is hydrated in chunks.
+func TestSearchCountsTwoPhaseChunksTheHydration(t *testing.T) {
+	t.Parallel()
+
+	_, mock, tx := beginMockTx(t)
+	page := sqlmock.NewRows([]string{"id"})
+	for i := 0; i <= sqlbuild.QueryBatchSize; i++ {
+		page.AddRow(fmt.Sprintf("bd-%03d", i))
+	}
+	mock.ExpectQuery(`^SELECT i\.id FROM issues i`).WillReturnRows(page)
+	mock.ExpectQuery(`issue_id IN \(`).WillReturnRows(liteCountsRows("bd-000"))
+	mock.ExpectQuery(`issue_id IN \(`).WillReturnRows(liteCountsRows(fmt.Sprintf("bd-%03d", sqlbuild.QueryBatchSize)))
+
+	got, err := SearchCountsTwoPhaseInTx(context.Background(), tx, IssuesFilterTables, "WHERE status = ?", "", "", []any{"open"}, true, liteHydration)
+	if err != nil {
+		t.Fatalf("SearchCountsTwoPhaseInTx: %v", err)
+	}
+	if want := "bd-000,bd-" + fmt.Sprint(sqlbuild.QueryBatchSize); strings.Join(iwcIDs(got), ",") != want {
+		t.Fatalf("rows = %v, want %s", iwcIDs(got), want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
+var liteHydration = sqlbuild.CountsHydration{Lite: true}
