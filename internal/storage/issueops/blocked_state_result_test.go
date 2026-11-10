@@ -32,10 +32,22 @@ func newBlockedStateResultMock(t *testing.T) (sqlmock.Sqlmock, DBTX) {
 // parent-child row must not run either read.
 //
 // Ordered before the execs because sqlmock is ordered and the runner reads
-// once per batch, then binds the ids into both statements.
+// once per batch, then binds the ids into the mark and the unmark's read.
 func expectBatchExogeneityRead(mock sqlmock.Sqlmock, depTable string) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(d.depends_on_issue_id), COUNT(d.depends_on_wisp_id)")).
 		WillReturnRows(sqlmock.NewRows([]string{"issue_parents", "wisp_parents"}).AddRow(0, 0))
+}
+
+// expectUnmarkRead expects the batched unmark's read of the scoped
+// should-be-blocked union (readShouldBeBlockedInTx), between the mark and the
+// unmark, answering it with stillBlocked.
+func expectUnmarkRead(mock sqlmock.Sqlmock, depTable string, stillBlocked ...string) {
+	rows := sqlmock.NewRows([]string{"issue_id"})
+	for _, id := range stillBlocked {
+		rows.AddRow(id)
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT /*+ JOIN_ORDER(d, t) LOOKUP_JOIN(d, t) */ d.issue_id FROM " + depTable + " d")).
+		WillReturnRows(rows)
 }
 
 // expectOwnEdgesProbe expects planRecomputeInTx's probe of depTable and
@@ -53,6 +65,7 @@ func expectBlockedStatePass(mock sqlmock.Sqlmock, table, alias string, mark, unm
 	expectBatchExogeneityRead(mock, blockedSpecFor(table).depTable)
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE " + table + " " + alias + " SET " + alias + ".is_blocked = 1")).
 		WillReturnResult(mark)
+	expectUnmarkRead(mock, blockedSpecFor(table).depTable)
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE " + table + " " + alias + " SET " + alias + ".is_blocked = 0")).
 		WillReturnResult(unmark)
 }
@@ -122,6 +135,7 @@ func TestRunMarkUnmarkBatchedInTxPropagatesRowsAffectedErrors(t *testing.T) {
 			} else {
 				mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 1")).
 					WillReturnResult(sqlmock.NewResult(0, 0))
+				expectUnmarkRead(mock, "dependencies")
 				mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 0")).
 					WillReturnResult(sqlmock.NewErrorResult(sentinel))
 			}
@@ -131,6 +145,44 @@ func TestRunMarkUnmarkBatchedInTxPropagatesRowsAffectedErrors(t *testing.T) {
 			)
 			if !errors.Is(err, sentinel) {
 				t.Fatalf("err = %v, want rows-affected error", err)
+			}
+		})
+	}
+}
+
+// TestRunMarkUnmarkBatchedInTxReadsBeforeTheUnmark pins the unmark's
+// statement sequence: the union is read AFTER the mark, and the unmark binds
+// what it returned instead of carrying the union as a subquery. The anchored
+// patterns match the whole unmark, so a union spliced back in fails them.
+func TestRunMarkUnmarkBatchedInTxReadsBeforeTheUnmark(t *testing.T) {
+	const unmarkHead = `^\s*UPDATE issues i SET i\.is_blocked = 0, i\.updated_at = i\.updated_at\s+` +
+		`WHERE i\.id IN \(\?,\?\)\s+AND i\.is_blocked = 1`
+	for _, tc := range []struct {
+		name         string
+		stillBlocked []string
+		pattern      string
+		args         []driver.Value
+	}{
+		{"read set bound", []string{"issue-2"},
+			unmarkHead + `\s+AND \( i\.status = 'closed' OR i\.status = 'pinned'\s+OR i\.id NOT IN \(\?\) \)\s*$`,
+			[]driver.Value{"issue-1", "issue-2", "issue-2"}},
+		{"empty read clears every flagged row", nil, unmarkHead + `\s*$`,
+			[]driver.Value{"issue-1", "issue-2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock, db := newBlockedStateResultMock(t)
+			expectBatchExogeneityRead(mock, "dependencies")
+			mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 1")).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+			expectUnmarkRead(mock, "dependencies", tc.stillBlocked...)
+			mock.ExpectExec(tc.pattern).WithArgs(tc.args...).WillReturnResult(sqlmock.NewResult(0, 1))
+
+			n, err := runMarkUnmarkBatchedInTx(context.Background(), db, issuesBlockedSpec, []string{"issue-1", "issue-2"})
+			if err != nil {
+				t.Fatalf("runMarkUnmarkBatchedInTx: %v", err)
+			}
+			if n != 2 {
+				t.Fatalf("changed = %d, want 2", n)
 			}
 		})
 	}
@@ -151,6 +203,7 @@ func TestRecomputeIsBlockedSkipsUnionForIDsWithoutEdges(t *testing.T) {
 	expectBatchExogeneityRead(mock, "dependencies")
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 1")).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectUnmarkRead(mock, "dependencies")
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 0")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE issues t SET t.is_blocked = 0, t.updated_at = t.updated_at")).
@@ -160,6 +213,7 @@ func TestRecomputeIsBlockedSkipsUnionForIDsWithoutEdges(t *testing.T) {
 	expectBatchExogeneityRead(mock, "dependencies")
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 1")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	expectUnmarkRead(mock, "dependencies")
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 0")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -201,6 +255,7 @@ func TestRecomputeIsBlockedSettlesClosedRowWithoutUnion(t *testing.T) {
 		expectBatchExogeneityRead(mock, "dependencies")
 		mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 1")).
 			WillReturnResult(sqlmock.NewResult(0, 0))
+		expectUnmarkRead(mock, "dependencies")
 		mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 0")).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectExec(regexp.QuoteMeta("UPDATE issues t SET t.is_blocked = 0, t.updated_at = t.updated_at")).
@@ -210,6 +265,7 @@ func TestRecomputeIsBlockedSettlesClosedRowWithoutUnion(t *testing.T) {
 		expectBatchExogeneityRead(mock, "dependencies")
 		mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 1")).
 			WillReturnResult(sqlmock.NewResult(0, 0))
+		expectUnmarkRead(mock, "dependencies")
 		mock.ExpectExec(regexp.QuoteMeta("UPDATE issues i SET i.is_blocked = 0")).
 			WillReturnResult(sqlmock.NewResult(0, 0))
 

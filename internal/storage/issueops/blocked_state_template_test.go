@@ -37,25 +37,38 @@ func explainedFixture() subtreeExplainedParents {
 	}
 }
 
+// batchedTemplates are the batched statements that splice the scoped union:
+// the two marks, and the two reads of it the unmarks bind
+// (readShouldBeBlockedInTx), which carry no outer row filter and so one
+// batch IN-list fewer (batchOccurrences). The unmark statements themselves
+// carry no union; TestUnmarkBlockedTemplateBindsTheReadSet pins them.
 func batchedTemplates(explained subtreeExplainedParents) map[string]string {
 	return map[string]string{
-		"markBlockedTemplateForIssues":   markBlockedTemplateForIssues(explained),
-		"unmarkBlockedTemplateForIssues": unmarkBlockedTemplateForIssues(explained),
-		"markBlockedTemplateForWisps":    markBlockedTemplateForWisps(explained),
-		"unmarkBlockedTemplateForWisps":  unmarkBlockedTemplateForWisps(explained),
+		"markBlockedTemplateForIssues": markBlockedTemplateForIssues(explained),
+		"markBlockedTemplateForWisps":  markBlockedTemplateForWisps(explained),
+		"unmarkReadForIssues":          shouldBeBlockedIDsUnionScopedPrecomputedSQL("dependencies", batchScopeSQL, explained),
+		"unmarkReadForWisps":           shouldBeBlockedIDsUnionScopedPrecomputedSQL("wisp_dependencies", batchScopeSQL, explained),
 	}
+}
+
+func batchOccurrences(name string) int {
+	if strings.HasPrefix(name, "unmarkRead") {
+		return batchTemplateOccurrences - 1
+	}
+	return batchTemplateOccurrences
 }
 
 func TestBatchedTemplatePercentBudget(t *testing.T) {
 	for name, tmpl := range batchedTemplates(explainedFixture()) {
 		t.Run(name, func(t *testing.T) {
-			if got := strings.Count(tmpl, "%s"); got != batchTemplateOccurrences {
-				t.Errorf("%%s count = %d, want %d — expandBatchTemplate binds one batch id group per occurrence, so a changed count must be a deliberate edit here", got, batchTemplateOccurrences)
+			want := batchOccurrences(name)
+			if got := strings.Count(tmpl, "%s"); got != want {
+				t.Errorf("%%s count = %d, want %d — expandBatchTemplate binds one batch id group per occurrence, so a changed count must be a deliberate edit here", got, want)
 			}
 			// The stray-percent guard: every percent sign in the finished
 			// template must belong to one of the %s verbs counted above.
-			if got := strings.Count(tmpl, "%"); got != batchTemplateOccurrences {
-				t.Errorf("total %% count = %d, want %d — a percent sign outside a %%s (LIKE 'x%%', %%d, %%%%) miscounts the template or corrupts the statement", got, batchTemplateOccurrences)
+			if got := strings.Count(tmpl, "%"); got != want {
+				t.Errorf("total %% count = %d, want %d — a percent sign outside a %%s (LIKE 'x%%', %%d, %%%%) miscounts the template or corrupts the statement", got, want)
 			}
 		})
 	}
@@ -98,10 +111,11 @@ func TestExpandBatchTemplateFillsEveryOccurrence(t *testing.T) {
 	placeholders, args := buildSQLInClause([]string{"issue-1", "issue-2"})
 	explained := explainedFixture()
 	bound := explained.args()
-	wantArgs := batchTemplateOccurrences*len(args) + len(bound)
 
 	for name, tmpl := range batchedTemplates(explained) {
 		t.Run(name, func(t *testing.T) {
+			occurrences := batchOccurrences(name)
+			wantArgs := occurrences*len(args) + len(bound)
 			stmt, stmtArgs, err := expandBatchTemplate(tmpl, placeholders, args, bound)
 			if err != nil {
 				t.Fatalf("expandBatchTemplate: %v", err)
@@ -116,16 +130,17 @@ func TestExpandBatchTemplateFillsEveryOccurrence(t *testing.T) {
 			if got := len(stmtArgs); got != wantArgs {
 				t.Fatalf("arg count = %d, want %d — placeholders and args must stay in lockstep", got, wantArgs)
 			}
-			// TEXT ORDER: the batch group for the outer filter and legs 1-2,
-			// then leg 3's batch group followed by the issue parents, then leg
-			// 4's batch group followed by the wisp parents, then leg 5's.
+			// TEXT ORDER: the batch group for the outer filter (marks only)
+			// and legs 1-2, then leg 3's batch group followed by the issue
+			// parents, then leg 4's batch group followed by the wisp parents,
+			// then leg 5's.
 			var want []interface{}
-			for k := 0; k < batchTemplateOccurrences; k++ {
+			for k := 0; k < occurrences; k++ {
 				want = append(want, args...)
-				if k == 3 {
+				if k == occurrences-3 {
 					want = append(want, "parent-1", "parent-2")
 				}
-				if k == 4 {
+				if k == occurrences-2 {
 					want = append(want, "wisp-parent-1")
 				}
 			}
@@ -135,6 +150,43 @@ func TestExpandBatchTemplateFillsEveryOccurrence(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestUnmarkBlockedTemplateBindsTheReadSet pins the unmark's shape: no
+// union, no subquery — the batch once, then the ids readShouldBeBlockedInTx
+// returned, in that text order — and no `NOT IN ()` over an empty read.
+func TestUnmarkBlockedTemplateBindsTheReadSet(t *testing.T) {
+	placeholders, args := buildSQLInClause([]string{"issue-1", "issue-2"})
+	for name, tmpl := range map[string]string{
+		"issues": unmarkBlockedTemplateForIssues(1),
+		"wisps":  unmarkBlockedTemplateForWisps(1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if strings.Contains(tmpl, "SELECT") || strings.Contains(tmpl, "UNION") {
+				t.Errorf("unmark template carries a subquery:\n%s", tmpl)
+			}
+			stmt, stmtArgs, err := expandBatchTemplate(tmpl, placeholders, args, []interface{}{"issue-2"})
+			if err != nil {
+				t.Fatalf("expandBatchTemplate: %v", err)
+			}
+			if !strings.Contains(stmt, ".id NOT IN (?) )") {
+				t.Errorf("unmark does not exclude the read set:\n%s", stmt)
+			}
+			want := []interface{}{"issue-1", "issue-2", "issue-2"}
+			if len(stmtArgs) != len(want) {
+				t.Fatalf("args = %v, want %v", stmtArgs, want)
+			}
+			for i := range want {
+				if stmtArgs[i] != want[i] {
+					t.Errorf("arg %d = %v, want %v", i, stmtArgs[i], want[i])
+				}
+			}
+		})
+	}
+	empty := unmarkBlockedTemplateForIssues(0)
+	if strings.Contains(empty, "NOT IN") || strings.Contains(empty, "status") || strings.Contains(empty, "?") {
+		t.Errorf("unmark over an empty read should clear every flagged batch row:\n%s", empty)
 	}
 }
 

@@ -986,14 +986,16 @@ func shouldBeBlockedIDsUnionPrecomputedSQL(depTable string, explained subtreeExp
 // It carries an
 // extra predicate on the dependency row appended to every leg's WHERE — "" for
 // the whole table (full repair, doctor count), batchScopeSQL for the batched
-// mark/unmark templates in blocked_state.go, which confine each leg to
-// d.issue_id IN (batch) so the union stays index-sized per statement. scope is
-// spliced verbatim: a %s inside it survives this Sprintf for the batch runner.
+// mark template and the batched unmark's read in blocked_state.go, which
+// confine each leg to d.issue_id IN (batch) so the union stays index-sized per
+// statement. scope is spliced verbatim: a %s inside it survives this Sprintf
+// for the batch runner.
 //
 // Like the unbatched form above, and unlike the shape this round replaced, the
 // two parent-child legs SUBTRACT AN ALREADY-READ id list rather than the query
 // that derives it: the batch runner reads the set once per batch
-// (scopedExplainedParentsInTx) and binds it into both statements. The caller
+// (scopedExplainedParentsInTx) and binds it into the mark and into the
+// unmark's read of this union (readShouldBeBlockedInTx). The caller
 // binds explained.args() once per splice, interleaved with the batch ids in
 // text order — expandBatchTemplate does that bookkeeping.
 //

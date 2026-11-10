@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -305,10 +306,13 @@ func markIsBlockedPassForIssuesInTx(ctx context.Context, tx DBTX, ids []string) 
 // makes stale-guard/conflict-guard consumers treat the row as user-edited.
 // An explicit assignment suppresses the ON UPDATE clause.
 //
-// Both templates decide membership through
+// Both statements decide membership through
 // shouldBeBlockedIDsUnionScopedPrecomputedSQL, the same uncorrelated union the
 // full repair and the doctor count use (blocked_consistency.go), scoped to the
 // batch: one derived blocked set per batch, computed once and probed by hash.
+// The mark splices it as `IN (union)`; the unmark READS it just before it runs
+// and binds the ids (readShouldBeBlockedInTx), because a spliced `NOT IN
+// (union)` was re-executed per candidate row on the Dolt sql-server.
 // The previous shape — five correlated EXISTS per outer row — was re-executed
 // per row by the engine: ~4 s per 200-id batch on committed, indexed data, and
 // unbounded (>69 min observed on dolt 2.1.8) over a large uncommitted working
@@ -316,16 +320,19 @@ func markIsBlockedPassForIssuesInTx(ctx context.Context, tx DBTX, ids []string) 
 // (gastownhall/beads#6288).
 //
 // The parent-child legs' exogeneity set (gastownhall/beads#6506) is READ once
-// per batch and BOUND into both statements as ids, never spliced as the query
-// that derives it: spliced, a 200-id recompute paid for the derivation four
-// times and measured 6.9x origin/main (scopedExplainedParentsInTx has the
-// numbers). Which is why the templates are built per batch rather than once:
-// the number of bound ids is a property of the batch.
+// per batch and BOUND into the mark and the unmark's read as ids, never
+// spliced as the query that derives it: spliced, a 200-id recompute paid for
+// the derivation four times and measured 6.9x origin/main
+// (scopedExplainedParentsInTx has the numbers). Which is why the statements
+// are built per batch rather than once: the number of bound ids is a property
+// of the batch.
 //
-// The batch IN-list therefore appears more than once per statement — the
-// outer row filter and one per union leg (six occurrences today) — and the
-// exogeneity ids appear as already-rendered ? placeholders inside two of those
-// legs. expandBatchTemplate binds both groups in TEXT order.
+// The batch IN-list therefore appears more than once in the mark — the outer
+// row filter and one per union leg (six occurrences today) — and once per leg
+// in the unmark's read; the exogeneity ids appear as already-rendered ?
+// placeholders inside two of those legs. The unmark itself carries the batch
+// once and the read's ids after it. expandBatchTemplate binds every group in
+// TEXT order.
 
 // batchScopeSQL is the per-leg predicate that confines the should-be-blocked
 // union to the batch (see shouldBeBlockedIDsUnionScopedPrecomputedSQL); its %s
@@ -349,16 +356,16 @@ func markBlockedTemplateForIssues(explained subtreeExplainedParents) string {
 	return markBlockedTemplate(issuesBlockedSpec, explained)
 }
 
-func unmarkBlockedTemplateForIssues(explained subtreeExplainedParents) string {
-	return unmarkBlockedTemplate(issuesBlockedSpec, explained)
+func unmarkBlockedTemplateForIssues(stillBlocked int) string {
+	return unmarkBlockedTemplate(issuesBlockedSpec, stillBlocked)
 }
 
 func markBlockedTemplateForWisps(explained subtreeExplainedParents) string {
 	return markBlockedTemplate(wispsBlockedSpec, explained)
 }
 
-func unmarkBlockedTemplateForWisps(explained subtreeExplainedParents) string {
-	return unmarkBlockedTemplate(wispsBlockedSpec, explained)
+func unmarkBlockedTemplateForWisps(stillBlocked int) string {
+	return unmarkBlockedTemplate(wispsBlockedSpec, stillBlocked)
 }
 
 // markBlockedTemplate is the batched mark statement for one table: the
@@ -379,19 +386,55 @@ func markBlockedTemplate(spec blockedTableSpec, explained subtreeExplainedParent
 }
 
 // unmarkBlockedTemplate is the batched unmark statement for one table: the
-// batch-scoped analog of unmarkAllBlockedSQL. NOT IN is null-hostile; the
-// union's d.issue_id IS NOT NULL guards keep it total.
+// batch-scoped analog of unmarkAllBlockedSQL, over stillBlocked ids the
+// caller has just READ (readShouldBeBlockedInTx) and binds after the batch.
 //
-//nolint:gosec // G201: the spec's fields are constants from the four callers above.
-func unmarkBlockedTemplate(spec blockedTableSpec, explained subtreeExplainedParents) string {
+// It used to splice the scoped union as `NOT IN (union)`, which the Dolt
+// sql-server re-executed per candidate row: ~0.55 cores of a shared server's
+// profile. It is the trade scopedExplainedParentsInTx made one level down,
+// for the same reason: the union is the same query either way, and a bound
+// id list is paid for once. An empty set drops the whole disjunction rather
+// than rendering `NOT IN ()`, a syntax error: no id is still blocked, so
+// every flagged row in the batch clears.
+//
+//nolint:gosec // G201: the spec's fields are constants from the two callers above.
+func unmarkBlockedTemplate(spec blockedTableSpec, stillBlocked int) string {
+	cond := ""
+	if stillBlocked > 0 {
+		cond = fmt.Sprintf(`AND ( %[1]s.status = 'closed' OR %[1]s.status = 'pinned'
+		        OR %[1]s.id NOT IN (%[2]s) )`,
+			spec.alias, strings.TrimSuffix(strings.Repeat("?,", stillBlocked), ","))
+	}
 	return fmt.Sprintf(`
 		UPDATE %[1]s %[2]s SET %[2]s.is_blocked = 0, %[2]s.updated_at = %[2]s.updated_at
 		WHERE %[2]s.id IN (%%s)
 		  AND %[2]s.is_blocked = 1
-		  AND ( %[2]s.status = 'closed' OR %[2]s.status = 'pinned'
-		        OR %[2]s.id NOT IN (%[3]s) )
-	`, spec.table, spec.alias,
-		shouldBeBlockedIDsUnionScopedPrecomputedSQL(spec.depTable, batchScopeSQL, explained))
+		  %[3]s
+	`, spec.table, spec.alias, cond)
+}
+
+// readShouldBeBlockedInTx reads the batch-scoped should-be-blocked union the
+// unmark statement used to splice: the same legs, the same batch scope and
+// the same bound exogeneity set, run as a plain SELECT. Every leg is scoped to
+// d.issue_id IN (batch), so the ids it returns are a subset of the batch.
+//
+// The caller runs it IMMEDIATELY before the unmark, after the mark. Legs 3-4
+// read p.is_blocked from the very tables these statements write, so the mark
+// can change the answer; read here, the set is what the spliced subquery saw:
+// the flags as they stood before the unmark statement (gastownhall/beads#7897
+// records the subquery reading the pre-statement flag). Sharing one read
+// between mark and unmark would hand the unmark the pre-MARK flags instead.
+func readShouldBeBlockedInTx(
+	ctx context.Context, tx DBTX, spec blockedTableSpec, placeholders string, args []interface{},
+	explained subtreeExplainedParents,
+) ([]string, error) {
+	query, queryArgs, err := expandBatchTemplate(
+		shouldBeBlockedIDsUnionScopedPrecomputedSQL(spec.depTable, batchScopeSQL, explained),
+		placeholders, args, explained.args())
+	if err != nil {
+		return nil, err
+	}
+	return queryIDs(ctx, tx, query, queryArgs...)
 }
 
 // expandBatchTemplate finishes a batched template: every %s takes the batch's
@@ -448,7 +491,9 @@ func markIsBlockedPassForWispsInTx(ctx context.Context, tx DBTX, ids []string) (
 }
 
 // batchExogeneity reads the batch-scoped exogeneity set for one chunk of ids:
-// ONE read for the chunk, shared by the chunk's mark and its unmark.
+// ONE read for the chunk, shared by the chunk's mark and its unmark. (The
+// should-be-blocked set derived with it is NOT shared: the unmark reads its
+// own after the mark has run, see readShouldBeBlockedInTx.)
 //
 // It is read before the mark, so the unmark sees the set as it was at the top
 // of the chunk. That is the same staleness the unbatched full repair accepts
@@ -493,8 +538,13 @@ func runMarkUnmarkBatchedInTx(ctx context.Context, tx DBTX, spec blockedTableSpe
 		}
 		changed += n
 
+		stillBlocked, err := readShouldBeBlockedInTx(ctx, tx, spec, placeholders, args, explained)
+		if err != nil {
+			return changed, fmt.Errorf("recompute is_blocked (unmark read): %w", err)
+		}
+		_, stillBlockedArgs := buildSQLInClause(stillBlocked)
 		stmt, stmtArgs, err = expandBatchTemplate(
-			unmarkBlockedTemplate(spec, explained), placeholders, args, explained.args())
+			unmarkBlockedTemplate(spec, len(stillBlocked)), placeholders, args, stillBlockedArgs)
 		if err != nil {
 			return changed, fmt.Errorf("recompute is_blocked (unmark): %w", err)
 		}
