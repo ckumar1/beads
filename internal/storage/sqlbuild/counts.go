@@ -102,13 +102,18 @@ func (h CountsHydration) IssueColumns() string {
 // filtering before vs. after them yields the identical row set — but it changes
 // the plan Dolt picks: instead of materializing the dep/rdep/comment/label/parent
 // aggregates and joining them to every main row before the WHERE prunes the
-// result, the joins now drive off the already-narrowed set. That is the win for
-// the narrow ephemeral-work searches that dominate the hot path. Only the WHERE
-// moves inward; orderBySQL and limitSQL remain after the joins, because ORDER BY
-// and LIMIT must see the projected aggregate columns and must apply to the final
-// joined result. An empty whereSQL keeps the plain "FROM <main> i" driver: there
-// is no predicate to push down, so the derived table would only interpose a
-// needless wrapper between the planner and the base table.
+// result, the joins now drive off the already-narrowed set. Only the WHERE
+// moves inward; orderBySQL and limitSQL remain after the joins, where they apply
+// to the final joined result. An empty whereSQL keeps the plain "FROM <main> i"
+// driver: there is no predicate to push down, so the derived table would only
+// interpose a needless wrapper between the planner and the base table.
+//
+// Narrowing the driver does not narrow the aggregate subqueries: each still
+// groups its whole side table on every call. So filtered searches no longer use
+// this form. issueops.SearchCountsTwoPhaseInTx selects their ids from the main
+// table first (ORDER BY names only main-table columns; see OrderBy) and
+// hydrates that page through the by-IDs form. The predicate form remains for
+// the unfiltered unbounded search and the unbounded ready-work list.
 //
 // That shape REQUIRES that whereSQL reference only main-table columns (or
 // correlated subqueries against labels/deps/comments keyed by id) — never the

@@ -169,10 +169,12 @@ func (r *issueSQLRepositoryImpl) runFilterSearchQuery(ctx context.Context, query
 	return r.runSearchQuery(ctx, tables, whereSQL, orderBy, searchWindowForFilter(filter).sql, args, includeWispReverseDeps, hydrationFor(filter))
 }
 
-//nolint:gosec // G201: SQL fragments are built from hardcoded table names and parameterized filters.
+// runSearchQuery runs one table family's filtered counts search through the
+// store-backed path's own body, issueops.SearchCountsTwoPhaseInTx: an id query
+// under the filter's WHERE, ORDER BY and window, then a by-IDs hydration of
+// that page. Sharing the body keeps the two backends on one statement shape.
 func (r *issueSQLRepositoryImpl) runSearchQuery(ctx context.Context, tables filterTables, whereSQL, orderBySQL, limitSQL string, args []any, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
-	searchSQL, _ := sqlbuild.SearchCountsSQL(tables, nil, whereSQL, orderBySQL, limitSQL, includeWispReverseDeps, hyd)
-	return r.scanCountsQuery(ctx, tables, searchSQL, args, hyd)
+	return issueops.SearchCountsTwoPhaseInTx(ctx, r.runner, tables, whereSQL, orderBySQL, limitSQL, args, includeWispReverseDeps, hyd)
 }
 
 // scanCountsQuery runs a prebuilt counts mega-query and hydrates each row,

@@ -130,7 +130,7 @@ func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, fil
 		limitSQL = fmt.Sprintf("LIMIT %d", eff)
 	}
 	orderBy := sqlbuild.OrderBy(filter.SortBy, filter.SortDesc, "i")
-	out, err := runSearchQueryInTx(ctx, tx, tables, whereSQL, orderBy, limitSQL, args, includeWispReverseDeps, hydrationFor(filter))
+	out, err := SearchCountsTwoPhaseInTx(ctx, tx, tables, whereSQL, orderBy, limitSQL, args, includeWispReverseDeps, hydrationFor(filter))
 	if err != nil {
 		return nil, err
 	}
@@ -141,16 +141,92 @@ func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, fil
 	return out, nil
 }
 
+// SearchCountsTwoPhaseInTx runs a filtered counts search for one table family
+// the way runReadyCountsInTx runs a ready page. Phase 1 selects the matching
+// ids from the main table alone, under the caller's WHERE, ORDER BY and LIMIT.
+// Phase 2 hydrates those ids through the by-IDs form of sqlbuild.SearchCountsSQL
+// and returns the rows in phase-1 order.
+//
+// The predicate form narrows the driver but not the aggregates: each label,
+// dependency, comment and parent subquery groups its whole side table on every
+// call, however few rows the filter keeps. The by-IDs form bounds every one of
+// them to the page. Rows and order are unchanged: phase 1 evaluates the same
+// WHERE in the same scope as the predicate form's derived driver (the main
+// table, alias "i"), and ORDER BY names only main-table columns (sqlbuild.OrderBy).
+//
+// With no WHERE and no LIMIT it keeps the single predicate-form statement: an
+// unfiltered, unbounded search reads every row anyway, so batching buys nothing.
+//
+// domain/db shares this body, and its runner may be a *sql.DB rather than a
+// transaction; an id deleted between the two phases is then skipped, as
+// fetchCountsByIDs already does on the union path.
+//
+//nolint:gosec // G201: SQL fragments are caller-built from hardcoded shapes; user input rides ? placeholders.
+func SearchCountsTwoPhaseInTx(ctx context.Context, tx DBTX, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
+	if whereSQL == "" && limitSQL == "" {
+		return runPredicateCountsQueryInTx(ctx, tx, tables, "", orderBySQL, "", args, includeWispReverseDeps, hyd)
+	}
+	idQuery := fmt.Sprintf("SELECT i.id FROM %s i %s %s %s", tables.Main, whereSQL, orderBySQL, limitSQL)
+	rows, err := tx.QueryContext(ctx, idQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search count %s: ids: %w", tables.Main, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("search count %s: scan id: %w", tables.Main, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("search count %s: ids: rows: %w", tables.Main, err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return hydrateCountsByIDsInTx(ctx, tx, tables, ids, includeWispReverseDeps, hyd)
+}
+
+// runPredicateCountsQueryInTx runs the predicate form of the counts
+// mega-query as one statement. The unbounded ready path still uses it.
+//
 //nolint:gosec // G201: SQL fragments are caller-built from hardcoded shapes
-func runSearchQueryInTx(ctx context.Context, tx DBTX, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
+func runPredicateCountsQueryInTx(ctx context.Context, tx DBTX, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
 	searchSQL, _ := sqlbuild.SearchCountsSQL(tables, nil, whereSQL, orderBySQL, limitSQL, includeWispReverseDeps, hyd)
 	return scanCountsRowsInTx(ctx, tx, tables.Main, searchSQL, args, hyd)
 }
 
+// hydrateCountsByIDsInTx hydrates distinct ids through the by-IDs form of the
+// counts mega-query in sqlbuild.QueryBatchSize chunks, keeping each statement
+// within every backend's placeholder limit (the form binds the page up to eight
+// times). Rows come back in ids order; an id with no row is skipped.
+func hydrateCountsByIDsInTx(ctx context.Context, tx DBTX, tables FilterTables, ids []string, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
+	byID := make(map[string]*types.IssueWithCounts, len(ids))
+	for start := 0; start < len(ids); start += sqlbuild.QueryBatchSize {
+		end := min(start+sqlbuild.QueryBatchSize, len(ids))
+		countsSQL, idArgs := sqlbuild.SearchCountsSQL(tables, ids[start:end], "", "", "", includeWispReverseDeps, hyd)
+		rows, err := scanCountsRowsInTx(ctx, tx, tables.Main, countsSQL, idArgs, hyd)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			byID[r.Issue.ID] = r
+		}
+	}
+	ordered := make([]*types.IssueWithCounts, 0, len(ids))
+	for _, id := range ids {
+		if r, ok := byID[id]; ok {
+			ordered = append(ordered, r)
+		}
+	}
+	return ordered, nil
+}
+
 // scanCountsRowsInTx runs a prebuilt counts mega-query and hydrates each row
 // through ScanReadyWorkRowWithCounts, deduping by issue ID. It is the single
-// scan/dedupe loop shared by the predicate-form search path and the by-IDs
-// ready-counts path.
+// scan/dedupe loop shared by the predicate form and the by-IDs form.
 //
 //nolint:gosec // G201: query is builder-produced; user input rides ? placeholders.
 func scanCountsRowsInTx(ctx context.Context, tx DBTX, mainTable, query string, args []interface{}, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
