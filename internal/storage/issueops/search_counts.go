@@ -156,7 +156,7 @@ func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, fil
 // Both phases must read one snapshot, so tx must be a transaction (domain/db
 // opens one over a pool). An empty phase 1 returns at once (an empty IN list is
 // not SQL), so a store missing a mandatory table such as leases no longer errors
-// on an empty filtered search; every other read on that store still fails.
+// on an empty filtered search; reads that touch the missing table still fail.
 //
 //nolint:gosec // G201: SQL fragments are caller-built from hardcoded shapes; user input rides ? placeholders.
 func SearchCountsTwoPhaseInTx(ctx context.Context, tx DBTX, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {

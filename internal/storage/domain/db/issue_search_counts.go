@@ -187,6 +187,8 @@ func (r *issueSQLRepositoryImpl) runSearchQuery(ctx context.Context, tables filt
 		defer func() { _ = tx.Rollback() }()
 		return issueops.SearchCountsTwoPhaseInTx(ctx, tx, tables, whereSQL, orderBySQL, limitSQL, args, includeWispReverseDeps, hyd)
 	case *sql.Conn, *sql.Tx:
+		// A *sql.Conn is safe only because the unit of work opened a
+		// transaction on it (uow.doltServerTx); an autocommit Conn would not share a snapshot.
 		return issueops.SearchCountsTwoPhaseInTx(ctx, r.runner, tables, whereSQL, orderBySQL, limitSQL, args, includeWispReverseDeps, hyd)
 	}
 	searchSQL, _ := sqlbuild.SearchCountsSQL(tables, nil, whereSQL, orderBySQL, limitSQL, includeWispReverseDeps, hyd)
