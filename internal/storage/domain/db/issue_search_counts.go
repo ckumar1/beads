@@ -169,12 +169,28 @@ func (r *issueSQLRepositoryImpl) runFilterSearchQuery(ctx context.Context, query
 	return r.runSearchQuery(ctx, tables, whereSQL, orderBy, searchWindowForFilter(filter).sql, args, includeWispReverseDeps, hydrationFor(filter))
 }
 
-// runSearchQuery runs one table family's filtered counts search through the
-// store-backed path's own body, issueops.SearchCountsTwoPhaseInTx: an id query
-// under the filter's WHERE, ORDER BY and window, then a by-IDs hydration of
-// that page. Sharing the body keeps the two backends on one statement shape.
+// runSearchQuery runs issueops.SearchCountsTwoPhaseInTx, whose two statements
+// must read one snapshot or a row closed or re-sorted between them leaks into
+// the page. A pooled *sql.DB gets a transaction of its own. The unit of work's
+// *sql.Conn is already inside START TRANSACTION (BeginTx on it would commit
+// that), and a *sql.Tx is one, so both are used as they are. Any other runner
+// gives no snapshot to share and keeps the single predicate-form statement.
+//
+//nolint:gosec // G201: SQL fragments are built from hardcoded table names and parameterized filters.
 func (r *issueSQLRepositoryImpl) runSearchQuery(ctx context.Context, tables filterTables, whereSQL, orderBySQL, limitSQL string, args []any, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
-	return issueops.SearchCountsTwoPhaseInTx(ctx, r.runner, tables, whereSQL, orderBySQL, limitSQL, args, includeWispReverseDeps, hyd)
+	switch runner := r.runner.(type) {
+	case *sql.DB:
+		tx, err := runner.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, fmt.Errorf("search count %s: begin: %w", tables.Main, err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		return issueops.SearchCountsTwoPhaseInTx(ctx, tx, tables, whereSQL, orderBySQL, limitSQL, args, includeWispReverseDeps, hyd)
+	case *sql.Conn, *sql.Tx:
+		return issueops.SearchCountsTwoPhaseInTx(ctx, r.runner, tables, whereSQL, orderBySQL, limitSQL, args, includeWispReverseDeps, hyd)
+	}
+	searchSQL, _ := sqlbuild.SearchCountsSQL(tables, nil, whereSQL, orderBySQL, limitSQL, includeWispReverseDeps, hyd)
+	return r.scanCountsQuery(ctx, tables, searchSQL, args, hyd)
 }
 
 // scanCountsQuery runs a prebuilt counts mega-query and hydrates each row,

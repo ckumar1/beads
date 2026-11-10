@@ -2,7 +2,9 @@ package issueops
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -235,28 +237,45 @@ func TestSearchCountsTwoPhaseUnfilteredUnboundedKeepsOneStatement(t *testing.T) 
 	}
 }
 
-// A page larger than sqlbuild.QueryBatchSize is hydrated in chunks.
+// A page larger than sqlbuild.QueryBatchSize is hydrated in chunks. Each chunk
+// binds exactly its own ids once per placeholder site (labels, dc, rc, rc-wisp,
+// cc, pc, d, driver), and every row comes back in id-query order.
 func TestSearchCountsTwoPhaseChunksTheHydration(t *testing.T) {
 	t.Parallel()
 
-	_, mock, tx := beginMockTx(t)
+	var captured []string
+	mock, tx := beginCapturingMockTx(t, &captured)
+	ids := make([]string, sqlbuild.QueryBatchSize+1)
 	page := sqlmock.NewRows([]string{"id"})
-	for i := 0; i <= sqlbuild.QueryBatchSize; i++ {
-		page.AddRow(fmt.Sprintf("bd-%03d", i))
+	for i := range ids {
+		ids[i] = fmt.Sprintf("bd-%03d", len(ids)-1-i) // descending, unlike the hydration's order
+		page.AddRow(ids[i])
 	}
 	mock.ExpectQuery(`^SELECT i\.id FROM issues i`).WillReturnRows(page)
-	mock.ExpectQuery(`issue_id IN \(`).WillReturnRows(liteCountsRows("bd-000"))
-	mock.ExpectQuery(`issue_id IN \(`).WillReturnRows(liteCountsRows(fmt.Sprintf("bd-%03d", sqlbuild.QueryBatchSize)))
+	for _, chunk := range [][]string{ids[:sqlbuild.QueryBatchSize], ids[sqlbuild.QueryBatchSize:]} {
+		var args []driver.Value
+		for range 8 {
+			for _, id := range chunk {
+				args = append(args, id)
+			}
+		}
+		mock.ExpectQuery(`issue_id IN \(`).WithArgs(args...).WillReturnRows(liteCountsRows(slices.Sorted(slices.Values(chunk))...))
+	}
 
 	got, err := SearchCountsTwoPhaseInTx(context.Background(), tx, IssuesFilterTables, "WHERE status = ?", "", "", []any{"open"}, true, liteHydration)
 	if err != nil {
 		t.Fatalf("SearchCountsTwoPhaseInTx: %v", err)
 	}
-	if want := "bd-000,bd-" + fmt.Sprint(sqlbuild.QueryBatchSize); strings.Join(iwcIDs(got), ",") != want {
-		t.Fatalf("rows = %v, want %s", iwcIDs(got), want)
+	if strings.Join(iwcIDs(got), ",") != strings.Join(ids, ",") {
+		t.Fatalf("rows = %v, want all %d ids in id-query order", iwcIDs(got), len(ids))
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+	for i, n := range []int{sqlbuild.QueryBatchSize, 1} {
+		if c := strings.Count(captured[i+1], "?"); c != 8*n {
+			t.Errorf("chunk %d has %d placeholders, want %d", i, c, 8*n)
+		}
 	}
 }
 

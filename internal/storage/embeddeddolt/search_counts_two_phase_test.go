@@ -88,7 +88,11 @@ func TestSearchCountsTwoPhaseMatchesPredicateForm(t *testing.T) {
 			if tc.name != "matches nothing" && len(want) == 0 {
 				t.Fatal("fixture must give the predicate form rows to compare")
 			}
-			for _, rs := range [][]*types.IssueWithCounts{want, got} {
+			viaStore, err := te.store.SearchIssuesWithCounts(ctx, tc.query, f)
+			must(t, err)
+			viaRepo, err := db.NewIssueSQLRepository(raw).SearchAcrossIssuesAndWispsWithCounts(ctx, tc.query, f)
+			must(t, err)
+			for _, rs := range [][]*types.IssueWithCounts{want, got, viaStore, viaRepo.Items} {
 				for _, iwc := range rs { // deps_json element order is not part of the contract
 					deps := iwc.Issue.Dependencies
 					sort.Slice(deps, func(i, j int) bool { return deps[i].DependsOnID < deps[j].DependsOnID })
@@ -101,17 +105,20 @@ func TestSearchCountsTwoPhaseMatchesPredicateForm(t *testing.T) {
 				t.Fatalf("two-phase rows differ from the predicate form:\n got %v\nwant %v", idsOf(got), idsOf(want))
 			}
 
+			// Both public seams: full rows (IsLitePartial and the hydrated columns
+			// included) and, on the repo seam, HasMore for a limited page.
+			var total int
+			must(t, raw.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues i "+whereSQL, args...).Scan(&total))
 			if f.Limit > 0 && len(want) > f.Limit {
 				want = want[:f.Limit]
 			}
-			viaStore, err := te.store.SearchIssuesWithCounts(ctx, tc.query, f)
-			must(t, err)
-			viaRepo, err := db.NewIssueSQLRepository(raw).SearchAcrossIssuesAndWispsWithCounts(ctx, tc.query, f)
-			must(t, err)
 			for seam, rs := range map[string][]*types.IssueWithCounts{"store": viaStore, "domain/db": viaRepo.Items} {
-				if !reflect.DeepEqual(idsOf(rs), idsOf(want)) {
-					t.Errorf("%s seam page = %v, want %v", seam, idsOf(rs), idsOf(want))
+				if !reflect.DeepEqual(rs, want) {
+					t.Errorf("%s seam rows differ: got %v, want %v", seam, idsOf(rs), idsOf(want))
 				}
+			}
+			if viaRepo.HasMore != (f.Limit > 0 && total > f.Limit) {
+				t.Errorf("domain/db HasMore = %v with %d matching rows and limit %d", viaRepo.HasMore, total, f.Limit)
 			}
 		})
 	}

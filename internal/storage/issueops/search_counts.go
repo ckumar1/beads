@@ -142,29 +142,26 @@ func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, fil
 }
 
 // SearchCountsTwoPhaseInTx runs a filtered counts search for one table family
-// the way runReadyCountsInTx runs a ready page. Phase 1 selects the matching
-// ids from the main table alone, under the caller's WHERE, ORDER BY and LIMIT.
-// Phase 2 hydrates those ids through the by-IDs form of sqlbuild.SearchCountsSQL
-// and returns the rows in phase-1 order.
-//
-// The predicate form narrows the driver but not the aggregates: each label,
-// dependency, comment and parent subquery groups its whole side table on every
-// call, however few rows the filter keeps. The by-IDs form bounds every one of
-// them to the page. Rows and order are unchanged: phase 1 evaluates the same
-// WHERE in the same scope as the predicate form's derived driver (the main
-// table, alias "i"), and ORDER BY names only main-table columns (sqlbuild.OrderBy).
+// as two statements, the shape runReadyCountsInTx uses for a ready page: the
+// matching ids from the main table alone, under the caller's WHERE, ORDER BY and
+// LIMIT, then their by-IDs hydration in phase-1 order. The predicate form's
+// aggregate subqueries group their whole side tables on every call; the by-IDs
+// form bounds them to the page. Rows and order are unchanged: phase 1 evaluates
+// the WHERE in the predicate form's driver scope (main table, alias "i"), and
+// ORDER BY names only main-table columns (sqlbuild.OrderBy).
 //
 // With no WHERE and no LIMIT it keeps the single predicate-form statement: an
-// unfiltered, unbounded search reads every row anyway, so batching buys nothing.
+// unfiltered, unbounded search reads every row anyway.
 //
-// domain/db shares this body, and its runner may be a *sql.DB rather than a
-// transaction; an id deleted between the two phases is then skipped, as
-// fetchCountsByIDs already does on the union path.
+// Both phases must read one snapshot, so tx must be a transaction (domain/db
+// opens one over a pool). An empty phase 1 returns at once (an empty IN list is
+// not SQL), so a store missing a mandatory table such as leases no longer errors
+// on an empty filtered search; every other read on that store still fails.
 //
 //nolint:gosec // G201: SQL fragments are caller-built from hardcoded shapes; user input rides ? placeholders.
 func SearchCountsTwoPhaseInTx(ctx context.Context, tx DBTX, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
 	if whereSQL == "" && limitSQL == "" {
-		return runPredicateCountsQueryInTx(ctx, tx, tables, "", orderBySQL, "", args, includeWispReverseDeps, hyd)
+		return runSearchQueryInTx(ctx, tx, tables, "", orderBySQL, "", args, includeWispReverseDeps, hyd)
 	}
 	idQuery := fmt.Sprintf("SELECT i.id FROM %s i %s %s %s", tables.Main, whereSQL, orderBySQL, limitSQL)
 	rows, err := tx.QueryContext(ctx, idQuery, args...)
@@ -189,11 +186,8 @@ func SearchCountsTwoPhaseInTx(ctx context.Context, tx DBTX, tables FilterTables,
 	return hydrateCountsByIDsInTx(ctx, tx, tables, ids, includeWispReverseDeps, hyd)
 }
 
-// runPredicateCountsQueryInTx runs the predicate form of the counts
-// mega-query as one statement. The unbounded ready path still uses it.
-//
 //nolint:gosec // G201: SQL fragments are caller-built from hardcoded shapes
-func runPredicateCountsQueryInTx(ctx context.Context, tx DBTX, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
+func runSearchQueryInTx(ctx context.Context, tx DBTX, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
 	searchSQL, _ := sqlbuild.SearchCountsSQL(tables, nil, whereSQL, orderBySQL, limitSQL, includeWispReverseDeps, hyd)
 	return scanCountsRowsInTx(ctx, tx, tables.Main, searchSQL, args, hyd)
 }
@@ -226,7 +220,8 @@ func hydrateCountsByIDsInTx(ctx context.Context, tx DBTX, tables FilterTables, i
 
 // scanCountsRowsInTx runs a prebuilt counts mega-query and hydrates each row
 // through ScanReadyWorkRowWithCounts, deduping by issue ID. It is the single
-// scan/dedupe loop shared by the predicate form and the by-IDs form.
+// scan/dedupe loop shared by the predicate-form search path and the by-IDs
+// ready-counts path.
 //
 //nolint:gosec // G201: query is builder-produced; user input rides ? placeholders.
 func scanCountsRowsInTx(ctx context.Context, tx DBTX, mainTable, query string, args []interface{}, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {

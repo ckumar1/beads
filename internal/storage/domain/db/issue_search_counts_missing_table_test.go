@@ -7,6 +7,7 @@ import (
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -88,5 +89,23 @@ func TestSearchCountsUnionUnrelatedErrorPropagates(t *testing.T) {
 	boom := errors.New("connection refused")
 	if _, _, err := unionCountsOverBrokenWispPlane(t, boom); !errors.Is(err, boom) {
 		t.Fatalf("counted search did not propagate a failed hydration: %v", err)
+	}
+}
+
+// On a pooled *sql.DB the id query and its by-IDs hydration run inside one
+// transaction, so a row closed between them cannot leak into the page.
+func TestSearchCountsTwoPhaseSharesOneTransaction(t *testing.T) {
+	mock, repo := newMockRepo(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`^SELECT i\.id FROM issues i WHERE status = \?`).WithArgs("open").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("bd-a"))
+	mock.ExpectQuery(`issue_id IN \(`).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectRollback()
+
+	if _, err := repo.runSearchQuery(t.Context(), issuesFilterTables, "WHERE status = ?", "", "LIMIT 1", []any{"open"}, true, sqlbuild.CountsHydration{}); err != nil {
+		t.Fatalf("runSearchQuery: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
 	}
 }
